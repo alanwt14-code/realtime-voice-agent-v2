@@ -2,10 +2,10 @@
   "name": "realtime-voice-agent-v2",
   "version": "1.0.0",
   "main": "index.js",
- "scripts": {
-  "start": "node server.js",
-  "test": "echo \"Error: no test specified\" && exit 1"
-},
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -13,6 +13,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "googleapis": "^171.4.0",
     "twilio": "^5.13.1",
     "ws": "^8.20.0"
   }
