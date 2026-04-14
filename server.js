@@ -36,11 +36,9 @@ wss.on('connection', (twilioWs) => {
 
   let streamSid = null;
   let openaiReady = false;
-  let greetingSent = false;
 
   if (!process.env.OPENAI_API_KEY) {
     console.error('Missing OPENAI_API_KEY');
-    twilioWs.close();
     return;
   }
 
@@ -54,35 +52,6 @@ wss.on('connection', (twilioWs) => {
     }
   );
 
-  function sendGreetingIfReady() {
-    if (!openaiReady || !streamSid || greetingSent || openaiWs.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    greetingSent = true;
-
-    openaiWs.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [
-          {
-            type: 'input_text',
-            text: 'The caller has just connected. Greet them naturally as the front desk of a dental office and ask how you can help.'
-          }
-        ]
-      }
-    }));
-
-    openaiWs.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        modalities: ['audio', 'text']
-      }
-    }));
-  }
-
   openaiWs.on('open', () => {
     console.log('Connected to OpenAI Realtime');
 
@@ -91,45 +60,35 @@ wss.on('connection', (twilioWs) => {
       session: {
         modalities: ['audio', 'text'],
         instructions:
-          'You are a warm, natural dental office receptionist answering the phone for a dental practice. Speak like a real human front desk staff member. Be brief, calm, friendly, and professional. Help callers with new patient questions, dental pain, emergencies, scheduling requests, and general office questions. Ask one question at a time. If someone has urgent pain, swelling, bleeding, trauma, or signs of infection, treat it as urgent and gather their name, callback number, and brief issue quickly. Do not say you are an AI unless directly asked. Keep responses short and conversational.',
+          'You are a friendly dental office receptionist. Greet the caller naturally and ask how you can help. Keep responses short and warm.',
         voice: 'alloy',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         turn_detection: {
-          type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 500
+          type: 'server_vad'
         }
       }
     }));
 
     openaiReady = true;
-    sendGreetingIfReady();
   });
 
   openaiWs.on('message', (message) => {
     try {
       const data = JSON.parse(message.toString());
 
-      if (data.type === 'session.created' || data.type === 'session.updated') {
+      if (data.type !== 'response.audio.delta') {
         console.log('OpenAI event:', data.type);
       }
 
       if (data.type === 'response.audio.delta' && data.delta && streamSid) {
-        if (twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({
-            event: 'media',
-            streamSid,
-            media: {
-              payload: data.delta
-            }
-          }));
-        }
-      }
-
-      if (data.type === 'response.done') {
-        console.log('OpenAI event: response.done');
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid,
+          media: {
+            payload: data.delta
+          }
+        }));
       }
 
       if (data.type === 'error') {
@@ -158,7 +117,18 @@ wss.on('connection', (twilioWs) => {
 
       if (data.event === 'start') {
         streamSid = data.start.streamSid;
-        sendGreetingIfReady();
+
+        if (openaiReady && openaiWs.readyState === WebSocket.OPEN) {
+          console.log('Sending initial greeting request to OpenAI');
+
+          openaiWs.send(JSON.stringify({
+            type: 'response.create',
+            response: {
+              modalities: ['audio', 'text'],
+              instructions: 'Greet the caller naturally as a dental office receptionist and ask how you can help.'
+            }
+          }));
+        }
       }
 
       if (data.event === 'media') {
@@ -181,7 +151,10 @@ wss.on('connection', (twilioWs) => {
   twilioWs.on('close', () => {
     console.log('Twilio WebSocket closed');
 
-    if (openaiWs.readyState === WebSocket.OPEN || openaiWs.readyState === WebSocket.CONNECTING) {
+    if (
+      openaiWs.readyState === WebSocket.OPEN ||
+      openaiWs.readyState === WebSocket.CONNECTING
+    ) {
       openaiWs.close();
     }
   });
