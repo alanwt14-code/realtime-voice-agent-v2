@@ -521,36 +521,30 @@ RULES:
 
           } else if (fnName === 'book_appointment') {
 
-            // ── Slot validation ──────────────────────────────────────────────
-            // Make sure the AI is only booking one of the exact slots we offered,
-            // not some arbitrary time it invented.
-            const requestedMs  = new Date(args.datetime).getTime();
-            const TOLERANCE_MS = 5 * 60 * 1000; // 5-minute window to account for minor ISO rounding
-            const isValidSlot  = offeredSlots.some(s =>
-              Math.abs(new Date(s.iso).getTime() - requestedMs) < TOLERANCE_MS
-            );
+            // Use the exact ISO datetime from the offeredSlots we gave the AI.
+            // Find the closest matching offered slot and use that datetime
+            // to avoid timezone mismatch between what we stored and what the AI sends back.
+            const requestedMs = new Date(args.datetime).getTime();
+            const closestSlot = offeredSlots.reduce((best, s) => {
+              const diff = Math.abs(new Date(s.iso).getTime() - requestedMs);
+              return (!best || diff < best.diff) ? { slot: s, diff } : best;
+            }, null);
 
-            if (!isValidSlot) {
-              result = {
-                success: false,
-                error:   'INVALID_SLOT',
-                message: 'That time was not one of the offered slots. Please call check_availability again to get fresh options and offer them to the caller.',
-              };
-            } else {
-              // ── Book it ────────────────────────────────────────────────────
-              const event = await createAppointment({
-                name:            args.name,
-                phone:           args.phone,
-                reason:          args.reason,
-                category:        args.category,
-                patientType:     args.patient_type,
-                datetime:        args.datetime,
-                durationMinutes: args.duration_minutes,
-              });
-              offeredSlots = []; // clear after a successful booking
-              callBooked   = true; // stop responding to further caller speech after booking
-              result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
-            }
+            const datetimeToBook     = closestSlot ? closestSlot.slot.iso : args.datetime;
+            const durationToBook     = closestSlot ? closestSlot.slot.durationMinutes : args.duration_minutes;
+
+            const event = await createAppointment({
+              name:            args.name,
+              phone:           args.phone,
+              reason:          args.reason,
+              category:        args.category,
+              patientType:     args.patient_type,
+              datetime:        datetimeToBook,
+              durationMinutes: durationToBook,
+            });
+            offeredSlots = [];
+            callBooked   = true;
+            result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
           }
         } catch (err) {
           console.error(`Tool ${fnName} failed:`, err.message);
@@ -583,7 +577,7 @@ RULES:
         if (fnName === 'check_availability') {
           if (result.success) {
             createAssistantResponse(
-              'The calendar has been checked. Read the formatted_slots to the caller — offer exactly the 2 options listed. Say something like "I have [slot 1] or [slot 2], which works better for you?" Then stop talking and wait for their answer. Do NOT book yet.'
+              'The calendar has been checked. Read the formatted_slots to the caller — offer exactly the 2 options listed. Say something like "I have [slot 1] or [slot 2], which works better for you?" Then stop talking and wait for their answer. Do NOT book yet. When the caller picks a time, use the exact ISO datetime string from the slots array when calling book_appointment.'
             );
           } else {
             createAssistantResponse(
