@@ -3,52 +3,303 @@ require('dotenv').config();
 const express = require('express');
 const twilio = require('twilio');
 const WebSocket = require('ws');
+const { google } = require('googleapis');
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETUP REQUIRED (before this works):
+//
+// 1. Run:  npm install googleapis
+//
+// 2. Add to your .env file:
+//    GOOGLE_SERVICE_ACCOUNT_EMAIL=your-sa@your-project.iam.gserviceaccount.com
+//    GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+//    GOOGLE_CALENDAR_ID=your-calendar-id@group.calendar.google.com
+//
+// 3. In Railway → Variables, add:
+//    TZ=America/New_York   ← change to your practice's timezone
+//    (This makes all JS Date methods use the right local time for your office)
+//
+// See bottom of file for step-by-step Google Calendar setup instructions.
+// ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.send('Realtime Voice Agent V2 is running');
+// ─────────────────────────────────────────────────────────────────────────────
+// Google Calendar Auth
+// ─────────────────────────────────────────────────────────────────────────────
+const calendarAuth = new google.auth.JWT({
+  email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+  key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  scopes: ['https://www.googleapis.com/auth/calendar'],
 });
+
+const calendarClient = google.calendar({ version: 'v3', auth: calendarAuth });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Business hours  (server uses local time — set TZ in Railway)
+// Keys: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+// null = closed that day
+// ─────────────────────────────────────────────────────────────────────────────
+const BUSINESS_HOURS = {
+  0: null,                     // Sunday  — closed
+  1: { open: 9, close: 17 },  // Monday
+  2: { open: 9, close: 17 },  // Tuesday
+  3: { open: 9, close: 17 },  // Wednesday
+  4: { open: 9, close: 17 },  // Thursday
+  5: { open: 9, close: 17 },  // Friday
+  6: { open: 9, close: 14 },  // Saturday
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Date helpers (all rely on TZ env being set correctly)
+// ─────────────────────────────────────────────────────────────────────────────
+function snapToNext30(date) {
+  const m = date.getMinutes();
+  if (m === 0) return;
+  if (m <= 30) {
+    date.setMinutes(30, 0, 0);
+  } else {
+    date.setHours(date.getHours() + 1, 0, 0, 0);
+  }
+}
+
+function advanceToNextBusinessOpen(date) {
+  date.setDate(date.getDate() + 1);
+  for (let i = 0; i < 7; i++) {
+    const h = BUSINESS_HOURS[date.getDay()];
+    if (h) { date.setHours(h.open, 0, 0, 0); return; }
+    date.setDate(date.getDate() + 1);
+  }
+}
+
+function formatSlotForSpeech(date) {
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const isTomorrow = date.toDateString() === tomorrow.toDateString();
+
+  const timeStr = date.toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+
+  if (isToday) return `today at ${timeStr}`;
+  if (isTomorrow) return `tomorrow at ${timeStr}`;
+  return `${date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at ${timeStr}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Availability logic
+//
+// Priority:  emergency (#1) > high_value (#2) > routine (#3)
+//
+// emergency  — same day if possible, up to 48 hours out, 60 min, 2 options
+// high_value — within 5 days, 60 min consult, 3 options (spread across days)
+// routine    — up to 4 weeks, 60 min (75 min for new patient cleaning), 3 options
+// ─────────────────────────────────────────────────────────────────────────────
+async function getAvailableSlots(category, patientType, reason) {
+  let durationMinutes, searchHours, maxOptions;
+
+  if (category === 'emergency') {
+    durationMinutes = 60;
+    searchHours    = 48;
+    maxOptions     = 2;
+  } else if (category === 'high_value') {
+    durationMinutes = 60;
+    searchHours    = 5 * 24;
+    maxOptions     = 3;
+  } else { // routine
+    const isNewPatientCleaning = patientType === 'new' && reason.toLowerCase().includes('clean');
+    durationMinutes = isNewPatientCleaning ? 75 : 60;
+    searchHours    = 28 * 24;
+    maxOptions     = 3;
+  }
+
+  const now       = new Date();
+  const searchEnd = new Date(now.getTime() + searchHours * 60 * 60 * 1000);
+
+  // Fetch busy times from Google Calendar
+  const freebusyRes = await calendarClient.freebusy.query({
+    requestBody: {
+      timeMin: now.toISOString(),
+      timeMax: searchEnd.toISOString(),
+      items: [{ id: CALENDAR_ID }],
+    },
+  });
+
+  const busyTimes = (freebusyRes.data.calendars[CALENDAR_ID]?.busy || []).map(b => ({
+    start: new Date(b.start),
+    end:   new Date(b.end),
+  }));
+
+  // Build starting point
+  const current = new Date(now);
+  if (category === 'emergency') {
+    // Give a 30-minute buffer so we can actually prepare
+    current.setTime(current.getTime() + 30 * 60 * 1000);
+  }
+  snapToNext30(current);
+
+  const slots = [];
+  let safety   = 0;
+
+  while (slots.length < maxOptions && current < searchEnd && safety++ < 500) {
+    const dayHours = BUSINESS_HOURS[current.getDay()];
+
+    // Closed today — jump to next open day
+    if (!dayHours) {
+      advanceToNextBusinessOpen(current);
+      continue;
+    }
+
+    // Before opening — jump to open time
+    if (current.getHours() < dayHours.open) {
+      current.setHours(dayHours.open, 0, 0, 0);
+      continue;
+    }
+
+    const slotEnd        = new Date(current.getTime() + durationMinutes * 60 * 1000);
+    const slotEndMinutes = slotEnd.getHours() * 60 + slotEnd.getMinutes();
+
+    // Slot would run past closing — jump to next open day
+    if (slotEndMinutes > dayHours.close * 60) {
+      advanceToNextBusinessOpen(current);
+      continue;
+    }
+
+    // Check for calendar conflicts
+    const conflict = busyTimes.find(b => current < b.end && slotEnd > b.start);
+
+    if (!conflict) {
+      // ✅ Slot is open — add it
+      slots.push(new Date(current));
+
+      if (category === 'emergency') {
+        // Pack emergency slots close together (same day preferred)
+        current.setTime(slotEnd.getTime());
+        snapToNext30(current);
+      } else {
+        // Spread routine/high_value options across different days
+        advanceToNextBusinessOpen(current);
+      }
+    } else {
+      // Jump past the conflict and try again
+      current.setTime(conflict.end.getTime());
+      snapToNext30(current);
+    }
+  }
+
+  return {
+    slots,
+    durationMinutes,
+    formatted: slots.map(formatSlotForSpeech),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Create a Google Calendar appointment
+// Color coding: emergency = red, high_value = yellow, routine = green
+//
+// Includes a final conflict re-check right before inserting to prevent
+// double-booking in the race condition where two callers pick the same slot.
+// ─────────────────────────────────────────────────────────────────────────────
+async function createAppointment({ name, phone, reason, category, patientType, datetime, durationMinutes }) {
+  const startTime = new Date(datetime);
+  const endTime   = new Date(startTime.getTime() + durationMinutes * 60 * 1000);
+
+  // ── Final conflict check (race condition guard) ──────────────────────────
+  // Re-check the exact slot one last time right before inserting.
+  // If another caller just booked it between check_availability and now, we catch it here.
+  const conflictCheck = await calendarClient.freebusy.query({
+    requestBody: {
+      timeMin: startTime.toISOString(),
+      timeMax: endTime.toISOString(),
+      items: [{ id: CALENDAR_ID }],
+    },
+  });
+
+  const conflicts = conflictCheck.data.calendars[CALENDAR_ID]?.busy || [];
+  if (conflicts.length > 0) {
+    // Slot was taken between when we offered it and now
+    throw new Error('SLOT_TAKEN');
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const labels = { emergency: '🚨 EMERGENCY', high_value: '⭐ HIGH VALUE', routine: '📋 ROUTINE' };
+  const colors = { emergency: '11', high_value: '5', routine: '2' };
+
+  const event = {
+    summary: `${labels[category]} — ${name} (${reason})`,
+    description: [
+      `Patient: ${name}`,
+      `Phone: ${phone}`,
+      `Reason: ${reason}`,
+      `Type: ${patientType} patient`,
+      `Category: ${category}`,
+      `Booked via AI Voice Agent`,
+    ].join('\n'),
+    start: { dateTime: startTime.toISOString(), timeZone: process.env.TZ || 'America/New_York' },
+    end:   { dateTime: endTime.toISOString(),   timeZone: process.env.TZ || 'America/New_York' },
+    colorId: colors[category],
+  };
+
+  const res = await calendarClient.events.insert({ calendarId: CALENDAR_ID, requestBody: event });
+  return res.data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Express routes
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.send('Realtime Voice Agent V2 is running'));
 
 app.post('/voice', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-
-  twiml.connect().stream({
-    url: `wss://${req.headers.host}/ws`
-  });
-
+  twiml.connect().stream({ url: `wss://${req.headers.host}/ws` });
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket bridge: Twilio <-> OpenAI Realtime
+// ─────────────────────────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (twilioWs) => {
   console.log('Twilio connected');
 
-  let streamSid = null;
-  let openaiReady = false;
-  let greetingSent = false;
-  let callClosed = false;
-  let assistantSpeaking = false;
+  let streamSid               = null;
+  let openaiReady             = false;
+  let greetingSent            = false;
+  let callClosed              = false;
+  let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
-  let pendingCallerResponse = false; // FIX: handles interruption case where caller speaks while AI is still talking
+  let pendingCallerResponse   = false;
+
+  // Slot validation: store the slots we offered so we can verify the AI only books one of them
+  // Each entry: { iso: string, durationMinutes: number }
+  let offeredSlots = [];
+
+  // Tool call tracking
+  let currentFunctionName    = null;
+  let currentFunctionCallId  = null;
+  let functionCallArgsBuffer = '';
 
   const openaiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', // FIX: corrected model name (was 'gpt-realtime' which doesn't exist)
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
     {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
-      }
+        'OpenAI-Beta': 'realtime=v1',
+      },
     }
   );
 
@@ -66,28 +317,23 @@ wss.on('connection', (twilioWs) => {
 
   function createAssistantResponse(instructionsText) {
     if (callClosed) return;
-
-    assistantSpeaking = true;
+    assistantSpeaking        = true;
     callerHasStartedSpeaking = false;
-    pendingCallerResponse = false; // FIX: always clear pending flag when we start a new response
-
+    pendingCallerResponse    = false;
     safeSendToOpenAI({
       type: 'response.create',
       response: {
         modalities: ['audio', 'text'],
-        instructions: instructionsText
-      }
+        ...(instructionsText ? { instructions: instructionsText } : {}),
+      },
     });
   }
 
   function sendGreeting() {
     if (!openaiReady || !streamSid || greetingSent || callClosed) return;
-
     greetingSent = true;
-    console.log('Triggering AI greeting');
-
     createAssistantResponse(
-      'Speak in English only. Say exactly: "Hi, thanks for calling Bright Smile Dental, how can I help you today?" Then stop speaking and wait for the caller to answer. Do not continue until the caller speaks.'
+      'Speak in English only. Say exactly: "Hi, thanks for calling Bright Smile Dental, how can I help you today?" Then stop and wait for the caller to answer.'
     );
   }
 
@@ -99,73 +345,45 @@ wss.on('connection', (twilioWs) => {
       session: {
         modalities: ['audio', 'text'],
         instructions: `
-You are a highly skilled, friendly front desk receptionist for Bright Smile Dental.
+You are a friendly, professional front desk receptionist for Bright Smile Dental.
+Speak in English only. Never invent the caller's side of the conversation.
 
-You must speak in English only.
-Never switch languages.
-Never continue in another language.
-Never invent the caller's side of the conversation.
-Never continue talking if the caller has not answered yet.
+VISIT CATEGORIES:
+- emergency  (#1 priority): tooth pain, swelling, broken tooth, bleeding, infection, trauma, abscess
+- high_value (#2 priority): implants, cosmetics, veneers, Invisalign, whitening, smile makeover
+- routine    (#3 priority): checkup, cleaning, x-rays, general exam, fillings
 
-Your job is to handle incoming calls naturally, efficiently, and professionally.
+REQUIRED FLOW (follow in exact order, never skip or reorder):
+1. Greet and ask how you can help.
+2. Listen and understand their reason for calling.
+3. If the reason is an EMERGENCY: ask exactly ONE follow-up question to understand urgency.
+   Pick the most relevant one based on what they said:
+   - "Are you in any pain right now?"
+   - "Is there any swelling?"
+   - "How long has this been going on?"
+   Only ask one. Then move on.
+4. Ask for their full name.
+5. Ask if they are a new or existing patient.
+6. Ask for their best callback phone number.
+7. Call check_availability with the correct category, patient type, and reason.
+8. Read out the available time slots clearly. Stop and wait for the caller to choose.
+9. Once they pick a time, call book_appointment to lock it in.
+   - If book_appointment returns SLOT_TAKEN or INVALID_SLOT, say something like:
+     "Sorry about that — that slot just got taken. Let me grab some fresh times for you."
+     Then call check_availability again and offer the new options.
+10. Confirm everything back: name, new/existing, phone number, reason, and appointment time.
+11. End warmly: "We'll see you then — have a great day!"
 
-CORE GOAL:
-Help the caller, collect the right information, and move toward booking smoothly.
-
-REQUIRED FLOW:
-1. Greet the caller first.
-2. Wait for the caller to explain why they are calling.
-3. Understand their issue first.
-4. After you understand their issue, collect in this exact order:
-   - full name
-   - new or existing patient
-   - best callback phone number
-5. Only after you have the issue, full name, new/existing status, and phone number, move to booking.
-6. When offering appointment times, offer one or two options and then STOP TALKING.
-7. Always wait for the caller's answer before continuing.
-8. Once the caller agrees on a time, confirm everything back to them clearly:
-   - their name
-   - new or existing patient
-   - their phone number
-   - reason for visit
-   - the appointment date and time
-   Then say something like "We'll see you then, have a great day!"
-
-STYLE:
-- warm
-- calm
-- human
-- concise
-- professional
-- one question at a time
-- short responses
-- no rambling
-- no repetition unless the caller was unclear
+URGENCY TONE:
+- emergency:  respond with empathy and urgency, move fast
+- high_value: warm and attentive, treat as a priority
+- routine:    relaxed and friendly
 
 RULES:
-- ask only one question at a time
-- do not ask for full name or phone number before you understand their issue
-- do not ask if they are a new or existing patient before you have their full name
-- do not ask for phone number before you know if they are new or existing
-- do not move into booking before you have: issue + full name + new/existing status + phone number
-- after asking whether a time works, wait for the caller's answer
-- do not ask another question until the caller responds
-- if the caller pauses briefly, wait rather than jumping in
-- do not say random filler like "sure" or "you're welcome" unless it directly fits the conversation
-- do not diagnose medical conditions
-
-IF THE ISSUE IS URGENT:
-If they mention pain, swelling, broken tooth, bleeding, infection, or trauma, respond with empathy and urgency.
-
-BOOKING STYLE:
-When it is time to book, guide the caller with one or two time options.
-Example:
-"I have something tomorrow at 10:00 AM or Thursday at 2:30 PM. Which works better for you?"
-Then wait for the caller's answer before saying anything else.
-
-IMPORTANT:
-After every question, wait for the caller's answer.
-Do not continue the script on your own.
+- One question at a time. Stop after asking. Wait for the answer.
+- Never move to the next step until the previous one is answered.
+- Never book without all of: issue + name + new/existing status + phone number.
+- Do not diagnose medical conditions.
         `,
         voice: 'alloy',
         input_audio_format: 'g711_ulaw',
@@ -176,16 +394,61 @@ Do not continue the script on your own.
           prefix_padding_ms: 300,
           silence_duration_ms: 1100,
           create_response: false,
-          interrupt_response: true
-        }
-      }
+          interrupt_response: true,
+        },
+        tools: [
+          {
+            type: 'function',
+            name: 'check_availability',
+            description: 'Check available appointment slots based on visit category. Call this only after you have collected the reason, full name, new/existing status, and phone number.',
+            parameters: {
+              type: 'object',
+              properties: {
+                category: {
+                  type: 'string',
+                  enum: ['emergency', 'high_value', 'routine'],
+                  description: 'emergency = urgent pain/trauma. high_value = cosmetic/implants. routine = checkup/cleaning.',
+                },
+                patient_type: {
+                  type: 'string',
+                  enum: ['new', 'existing'],
+                },
+                reason: {
+                  type: 'string',
+                  description: 'Brief description of why they are calling.',
+                },
+              },
+              required: ['category', 'patient_type', 'reason'],
+            },
+          },
+          {
+            type: 'function',
+            name: 'book_appointment',
+            description: 'Book the appointment on the calendar once the caller has agreed on a specific time slot.',
+            parameters: {
+              type: 'object',
+              properties: {
+                name:             { type: 'string', description: 'Caller\'s full name.' },
+                phone:            { type: 'string', description: 'Caller\'s callback phone number.' },
+                reason:           { type: 'string', description: 'Reason for the visit.' },
+                category:         { type: 'string', enum: ['emergency', 'high_value', 'routine'] },
+                patient_type:     { type: 'string', enum: ['new', 'existing'] },
+                datetime:         { type: 'string', description: 'ISO 8601 datetime of the appointment start.' },
+                duration_minutes: { type: 'number', description: 'Appointment duration in minutes.' },
+              },
+              required: ['name', 'phone', 'reason', 'category', 'patient_type', 'datetime', 'duration_minutes'],
+            },
+          },
+        ],
+        tool_choice: 'auto',
+      },
     });
 
     openaiReady = true;
     sendGreeting();
   });
 
-  openaiWs.on('message', (message) => {
+  openaiWs.on('message', async (message) => {
     try {
       const data = JSON.parse(message.toString());
 
@@ -193,33 +456,125 @@ Do not continue the script on your own.
         console.log('OpenAI event:', data.type);
       }
 
+      // Stream audio back to Twilio
       if (data.type === 'response.audio.delta' && data.delta && streamSid) {
-        safeSendToTwilio({
-          event: 'media',
-          streamSid,
-          media: {
-            payload: data.delta
+        safeSendToTwilio({ event: 'media', streamSid, media: { payload: data.delta } });
+      }
+
+      // Track function call name + ID when a tool call starts
+      if (data.type === 'response.output_item.added' && data.item?.type === 'function_call') {
+        currentFunctionName   = data.item.name;
+        currentFunctionCallId = data.item.call_id;
+        functionCallArgsBuffer = '';
+        console.log(`Tool call started: ${currentFunctionName}`);
+      }
+
+      // Buffer streaming arguments
+      if (data.type === 'response.function_call_arguments.delta') {
+        functionCallArgsBuffer += data.delta;
+      }
+
+      // Execute tool when arguments are fully received
+      if (data.type === 'response.function_call_arguments.done') {
+        const args   = JSON.parse(functionCallArgsBuffer);
+        const fnName = currentFunctionName;
+        const callId = currentFunctionCallId;
+        console.log(`Executing tool: ${fnName}`, args);
+
+        let result;
+        try {
+          if (fnName === 'check_availability') {
+            const availability = await getAvailableSlots(args.category, args.patient_type, args.reason);
+
+            // Store offered slots server-side so we can validate the booking later
+            offeredSlots = availability.slots.map(s => ({
+              iso:             s.toISOString(),
+              durationMinutes: availability.durationMinutes,
+            }));
+
+            result = {
+              success:          true,
+              category:         args.category,
+              duration_minutes: availability.durationMinutes,
+              slots:            availability.slots.map(s => s.toISOString()),
+              formatted_slots:  availability.formatted, // human-readable for the AI to read aloud
+            };
+
+          } else if (fnName === 'book_appointment') {
+
+            // ── Slot validation ──────────────────────────────────────────────
+            // Make sure the AI is only booking one of the exact slots we offered,
+            // not some arbitrary time it invented.
+            const requestedMs  = new Date(args.datetime).getTime();
+            const TOLERANCE_MS = 5 * 60 * 1000; // 5-minute window to account for minor ISO rounding
+            const isValidSlot  = offeredSlots.some(s =>
+              Math.abs(new Date(s.iso).getTime() - requestedMs) < TOLERANCE_MS
+            );
+
+            if (!isValidSlot) {
+              result = {
+                success: false,
+                error:   'INVALID_SLOT',
+                message: 'That time was not one of the offered slots. Please call check_availability again to get fresh options and offer them to the caller.',
+              };
+            } else {
+              // ── Book it ────────────────────────────────────────────────────
+              const event = await createAppointment({
+                name:            args.name,
+                phone:           args.phone,
+                reason:          args.reason,
+                category:        args.category,
+                patientType:     args.patient_type,
+                datetime:        args.datetime,
+                durationMinutes: args.duration_minutes,
+              });
+              offeredSlots = []; // clear after a successful booking
+              result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
+            }
           }
+        } catch (err) {
+          console.error(`Tool ${fnName} failed:`, err.message);
+
+          // Handle slot-taken race condition gracefully
+          if (err.message === 'SLOT_TAKEN') {
+            result = {
+              success: false,
+              error:   'SLOT_TAKEN',
+              message: 'That slot was just taken by another caller. Call check_availability again to get fresh available times and offer them to the caller.',
+            };
+          } else {
+            result = { success: false, error: err.message };
+          }
+        }
+
+        console.log(`${fnName} result:`, result);
+
+        // Send result back to OpenAI and trigger next response
+        safeSendToOpenAI({
+          type: 'conversation.item.create',
+          item: {
+            type:    'function_call_output',
+            call_id: callId,
+            output:  JSON.stringify(result),
+          },
         });
+        safeSendToOpenAI({ type: 'response.create' });
       }
 
       if (data.type === 'response.done') {
         assistantSpeaking = false;
         console.log('Assistant finished speaking');
 
-        // FIX: if the caller spoke and stopped while the AI was still talking (interruption),
-        // now that the AI response is fully done/cancelled, trigger the response to what the caller said
+        // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
           pendingCallerResponse = false;
           createAssistantResponse(
-            'The caller just interrupted you. Respond in English only as the dental receptionist. Continue naturally based on what the caller said. Follow the session instructions in order: understand the issue first, then get full name, then ask if they are a new or existing patient, then get their phone number, then move to booking. Ask only one question at a time and wait for the caller to respond.'
+            'The caller just interrupted. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow. One question at a time.'
           );
         }
       }
 
-      // FIX: removed the 'if (!assistantSpeaking)' guard here.
-      // We need to always track when the caller starts speaking — including interruptions.
-      // Previously, if the AI was talking, this flag never got set, so interruptions were silently ignored.
+      // Always track when caller starts speaking (including during interruptions)
       if (data.type === 'input_audio_buffer.speech_started') {
         callerHasStartedSpeaking = true;
         console.log('Caller started speaking');
@@ -230,15 +585,14 @@ Do not continue the script on your own.
 
         if (callerHasStartedSpeaking) {
           if (!assistantSpeaking) {
-            // Normal case: AI is already silent, respond immediately
+            // Normal turn: AI is silent, respond now
             createAssistantResponse(
-              'Respond in English only as the dental office receptionist. Continue naturally from the caller\'s last message. Follow the session instructions in order: understand the issue first, then get full name, then ask if they are a new or existing patient, then get their phone number, then move to booking. Once they agree on a time, confirm all details back to them. Ask only one question at a time and stop speaking after you ask it.'
+              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow in order: understand issue → name → new/existing → phone → check_availability → offer times → book_appointment → confirm everything. One question at a time.'
             );
           } else {
-            // FIX: Interruption case — the AI is still finishing up (or being cancelled).
-            // Set the pending flag and we will respond once response.done fires above.
+            // Interruption: AI is still finishing — flag it and respond once done
             pendingCallerResponse = true;
-            console.log('Caller interrupted — will respond after current AI response finishes');
+            console.log('Caller interrupted — will respond after AI finishes');
           }
         }
       }
@@ -247,7 +601,7 @@ Do not continue the script on your own.
         console.error('OpenAI error:', JSON.stringify(data, null, 2));
       }
     } catch (error) {
-      console.error('Error parsing OpenAI message:', error.message);
+      console.error('Error processing OpenAI message:', error.message);
     }
   });
 
@@ -265,41 +619,69 @@ Do not continue the script on your own.
       }
 
       if (data.event === 'media') {
-        safeSendToOpenAI({
-          type: 'input_audio_buffer.append',
-          audio: data.media.payload
-        });
+        safeSendToOpenAI({ type: 'input_audio_buffer.append', audio: data.media.payload });
       }
 
       if (data.event === 'stop') {
         console.log('Twilio stream stopped');
       }
     } catch (error) {
-      console.error('Error parsing Twilio message:', error.message);
+      console.error('Error processing Twilio message:', error.message);
     }
   });
 
   twilioWs.on('close', () => {
     callClosed = true;
     console.log('Call ended');
-
-    if (
-      openaiWs.readyState === WebSocket.OPEN ||
-      openaiWs.readyState === WebSocket.CONNECTING
-    ) {
+    if (openaiWs.readyState === WebSocket.OPEN || openaiWs.readyState === WebSocket.CONNECTING) {
       openaiWs.close();
     }
   });
 
-  openaiWs.on('close', () => {
-    console.log('OpenAI connection closed');
-  });
-
-  openaiWs.on('error', (error) => {
-    console.error('OpenAI error:', error.message);
-  });
-
-  twilioWs.on('error', (error) => {
-    console.error('Twilio error:', error.message);
-  });
+  openaiWs.on('close', () => console.log('OpenAI connection closed'));
+  openaiWs.on('error', (err) => console.error('OpenAI WebSocket error:', err.message));
+  twilioWs.on('error', (err) => console.error('Twilio WebSocket error:', err.message));
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GOOGLE CALENDAR SETUP (do this once to connect your demo calendar)
+//
+// STEP 1 — Create a Google Cloud project
+//   → Go to: https://console.cloud.google.com
+//   → Create a new project (name it anything, e.g. "Dental Voice Agent")
+//
+// STEP 2 — Enable the Google Calendar API
+//   → In your project, go to APIs & Services → Library
+//   → Search "Google Calendar API" → Enable it
+//
+// STEP 3 — Create a Service Account
+//   → Go to APIs & Services → Credentials → Create Credentials → Service Account
+//   → Name it anything (e.g. "voice-agent"), click Done
+//   → Click the service account → Keys tab → Add Key → JSON
+//   → A .json file downloads — open it and copy:
+//       "client_email"  → this is your GOOGLE_SERVICE_ACCOUNT_EMAIL
+//       "private_key"   → this is your GOOGLE_PRIVATE_KEY
+//
+// STEP 4 — Create a demo Google Calendar
+//   → Go to: https://calendar.google.com
+//   → Click + (Other calendars) → Create new calendar
+//   → Name it "Bright Smile Dental Demo"
+//   → Go to its Settings → Share with specific people
+//   → Add your service account email (client_email from the JSON)
+//   → Give it "Make changes to events" permission
+//   → Scroll down to "Integrate calendar" → copy the Calendar ID
+//   → This is your GOOGLE_CALENDAR_ID
+//
+// STEP 5 — Add to Railway environment variables:
+//   GOOGLE_SERVICE_ACCOUNT_EMAIL = (client_email from JSON)
+//   GOOGLE_PRIVATE_KEY            = (private_key from JSON — keep the \n characters)
+//   GOOGLE_CALENDAR_ID            = (Calendar ID from Step 4)
+//   TZ                            = America/New_York  (or your timezone)
+//
+// STEP 6 — Deploy:
+//   git add server.js
+//   git commit -m "add Google Calendar booking"
+//   git push
+//
+// That's it — calls will now appear in your demo calendar color-coded by priority.
+// ─────────────────────────────────────────────────────────────────────────────
