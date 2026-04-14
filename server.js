@@ -37,8 +37,9 @@ wss.on('connection', (twilioWs) => {
   let streamSid = null;
   let openaiReady = false;
   let greetingSent = false;
-  let callClosed = false;
+  let greetingFinished = false;
   let allowCallerAudio = false;
+  let callClosed = false;
 
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-realtime',
@@ -51,21 +52,13 @@ wss.on('connection', (twilioWs) => {
   );
 
   function safeSendToOpenAI(payload) {
-    if (
-      !callClosed &&
-      openaiWs &&
-      openaiWs.readyState === WebSocket.OPEN
-    ) {
+    if (!callClosed && openaiWs.readyState === WebSocket.OPEN) {
       openaiWs.send(JSON.stringify(payload));
     }
   }
 
   function safeSendToTwilio(payload) {
-    if (
-      !callClosed &&
-      twilioWs &&
-      twilioWs.readyState === WebSocket.OPEN
-    ) {
+    if (!callClosed && twilioWs.readyState === WebSocket.OPEN) {
       twilioWs.send(JSON.stringify(payload));
     }
   }
@@ -81,7 +74,7 @@ wss.on('connection', (twilioWs) => {
       response: {
         modalities: ['audio', 'text'],
         instructions:
-          'Speak in English only. Say exactly: "Hi, thanks for calling Bright Smile Dental, how can I help you today?" Then stop speaking and wait for the caller to answer.'
+          'Speak in English only. Say exactly: "Hi, thanks for calling Bright Smile Dental, how can I help you today?" Then stop speaking and wait for the caller to answer. Do not continue talking unless the caller speaks first.'
       }
     });
   }
@@ -99,31 +92,25 @@ You are a highly skilled, friendly front desk receptionist for Bright Smile Dent
 You must speak in English only.
 Never switch languages.
 Never continue in another language.
-Do not say "thank you, you're welcome" to yourself or produce filler conversation.
+Do not invent both sides of the conversation.
+Do not answer for the caller.
+Do not continue talking after your greeting unless the caller actually speaks first.
 
-Your job is to handle incoming calls naturally, efficiently, and professionally, like a real human receptionist.
+Your job is to handle incoming calls naturally, efficiently, and professionally.
 
 RULES:
-- Greet first if the call has just started.
-- After the greeting, wait for the caller to speak.
-- Do not speak twice in a row unless the caller clearly asked a follow-up.
-- Ask only one question at a time.
-- Keep responses short and natural.
-- Do not repeat information the caller already gave.
-- Do not ramble.
-- Stay in English only.
-- If the caller pauses briefly, do not jump in too fast.
-- Do not invent both sides of the conversation.
-
-GOALS:
-- understand why the caller is calling
-- guide the conversation smoothly
-- collect key information
-- move toward booking when appropriate
+- greet first
+- after the greeting, wait for the caller
+- ask one question at a time
+- keep responses short
+- do not ramble
+- do not repeat information the caller already gave
+- do not jump in too quickly if the caller pauses briefly
+- do not say random filler like "sure" or "you're welcome" unless it truly fits the caller's words
 
 STYLE:
-- calm
 - warm
+- calm
 - clear
 - concise
 - human
@@ -132,24 +119,20 @@ If the caller mentions pain, swelling, broken tooth, or urgency, respond with em
 
 If the caller mentions cleaning, checkup, or general visit, treat it as routine and guide toward scheduling.
 
-If the caller mentions cosmetic or major work, guide them toward a consultation.
-
 Only ask for missing information when needed:
 - name
 - callback number
 - issue
 - preferred time
-
-At the end, confirm key details clearly.
         `,
         voice: 'alloy',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.6,
+          threshold: 0.7,
           prefix_padding_ms: 300,
-          silence_duration_ms: 900
+          silence_duration_ms: 1200
         }
       }
     });
@@ -176,11 +159,18 @@ At the end, confirm key details clearly.
         });
       }
 
-      if (data.type === 'response.done') {
-        if (!allowCallerAudio && greetingSent) {
-          console.log('Greeting finished, caller audio now allowed');
+      if (data.type === 'response.done' && greetingSent && !greetingFinished) {
+        greetingFinished = true;
+        console.log('Greeting finished');
+
+        safeSendToOpenAI({
+          type: 'input_audio_buffer.clear'
+        });
+
+        setTimeout(() => {
           allowCallerAudio = true;
-        }
+          console.log('Caller audio now allowed');
+        }, 1200);
       }
     } catch (error) {
       console.error('Error parsing OpenAI message:', error.message);
@@ -222,9 +212,8 @@ At the end, confirm key details clearly.
     console.log('Call ended');
 
     if (
-      openaiWs &&
-      (openaiWs.readyState === WebSocket.OPEN ||
-        openaiWs.readyState === WebSocket.CONNECTING)
+      openaiWs.readyState === WebSocket.OPEN ||
+      openaiWs.readyState === WebSocket.CONNECTING
     ) {
       openaiWs.close();
     }
