@@ -569,7 +569,7 @@ RULES:
 
         console.log(`${fnName} result:`, result);
 
-        // Send result back to OpenAI and trigger next response
+        // Send result back to OpenAI
         safeSendToOpenAI({
           type: 'conversation.item.create',
           item: {
@@ -578,7 +578,33 @@ RULES:
             output:  JSON.stringify(result),
           },
         });
-        safeSendToOpenAI({ type: 'response.create' });
+
+        // Give the AI explicit instructions for what to do next based on the tool result
+        if (fnName === 'check_availability') {
+          if (result.success) {
+            createAssistantResponse(
+              'The calendar has been checked. Read the formatted_slots to the caller — offer exactly the 2 options listed. Say something like "I have [slot 1] or [slot 2], which works better for you?" Then stop talking and wait for their answer. Do NOT book yet.'
+            );
+          } else {
+            createAssistantResponse(
+              'The calendar check failed. Apologize briefly and tell the caller you\'re having trouble accessing the schedule, then ask them to call back or leave a number for a callback.'
+            );
+          }
+        } else if (fnName === 'book_appointment') {
+          if (result.success) {
+            createAssistantResponse(
+              'The appointment is confirmed and in the calendar. Read back the full confirmation to the caller: their name, whether they are new or existing, their phone number, the reason for the visit, and the appointment date and time. Then say "We\'ll see you then — have a great day!" Do not call any more tools. The call is finished.'
+            );
+          } else if (result.error === 'SLOT_TAKEN') {
+            createAssistantResponse(
+              'That slot was just taken by another caller. Say: "Sorry about that — that time just got taken. Let me find you some fresh options." Then call check_availability again with the same details and offer the new 2 slots.'
+            );
+          } else {
+            createAssistantResponse(
+              'The booking failed. Apologize and call check_availability again to offer fresh time options to the caller.'
+            );
+          }
+        }
       }
 
       if (data.type === 'response.done') {
