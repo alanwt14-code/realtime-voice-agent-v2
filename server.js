@@ -39,6 +39,7 @@ wss.on('connection', (twilioWs) => {
   let greetingSent = false;
   let callClosed = false;
   let assistantSpeaking = false;
+  let callerHasStartedSpeaking = false;
 
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-realtime',
@@ -63,7 +64,10 @@ wss.on('connection', (twilioWs) => {
   }
 
   function createAssistantResponse(instructionsText) {
+    if (callClosed) return;
+
     assistantSpeaking = true;
+    callerHasStartedSpeaking = false;
 
     safeSendToOpenAI({
       type: 'response.create',
@@ -110,7 +114,7 @@ REQUIRED FLOW:
 1. Greet the caller first.
 2. Wait for the caller to explain why they are calling.
 3. Understand their issue first.
-4. After you understand the issue, collect:
+4. After you understand their issue, collect:
    - full name
    - best callback phone number
 5. Only after you have the issue, full name, and phone number, move to booking.
@@ -134,7 +138,7 @@ RULES:
 - do not ask for full name or phone number before you understand their issue
 - do not move into booking before you have:
   issue + full name + phone number
-- after asking whether a time works, wait for the caller to answer
+- after asking whether a time works, wait for the caller's answer
 - do not ask another question until the caller responds
 - if the caller pauses briefly, wait rather than jumping in
 - do not say random filler like "sure" or "you're welcome" unless it directly fits the conversation
@@ -158,9 +162,9 @@ Do not continue the script on your own.
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.7,
+          threshold: 0.75,
           prefix_padding_ms: 300,
-          silence_duration_ms: 1000,
+          silence_duration_ms: 1100,
           create_response: false,
           interrupt_response: true
         }
@@ -195,16 +199,19 @@ Do not continue the script on your own.
       }
 
       if (data.type === 'input_audio_buffer.speech_started') {
-        console.log('Caller started speaking');
+        if (!assistantSpeaking) {
+          callerHasStartedSpeaking = true;
+          console.log('Caller started speaking');
+        }
       }
 
       if (data.type === 'input_audio_buffer.speech_stopped') {
         console.log('Caller stopped speaking');
 
-        // Let the model respond only after the caller has actually finished.
-        if (!assistantSpeaking) {
+        // ONLY respond if there was a real caller speech start first
+        if (!assistantSpeaking && callerHasStartedSpeaking) {
           createAssistantResponse(
-            'Respond in English only as the dental office receptionist. Continue naturally from the caller’s last message. If you do not yet know their issue, ask about it. If you know the issue but do not yet have their full name, ask for their full name. If you have their issue and full name but not their phone number, ask for their best callback phone number. Only after you have the issue, full name, and phone number should you move to booking. If you offer appointment times, stop speaking afterward and wait for the caller’s answer.'
+            'Respond in English only as the dental office receptionist. Continue naturally from the caller’s last message. If you do not yet know their issue, ask about it. If you know their issue but do not yet have their full name, ask for their full name. If you have their issue and full name but not their phone number, ask for their best callback phone number. Only after you have the issue, full name, and phone number should you move to booking. If you offer appointment times, stop speaking afterward and wait for the caller’s answer.'
           );
         }
       }
