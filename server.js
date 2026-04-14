@@ -104,22 +104,20 @@ function formatSlotForSpeech(date) {
 // high_value — within 5 days, 60 min consult, 3 options (spread across days)
 // routine    — up to 4 weeks, 60 min (75 min for new patient cleaning), 3 options
 // ─────────────────────────────────────────────────────────────────────────────
-async function getAvailableSlots(category, patientType, reason) {
-  let durationMinutes, searchHours, maxOptions;
+async function getAvailableSlots(category, patientType, reason, timePreference = 'any') {
+  let durationMinutes, searchHours;
+  const maxOptions = 2; // Always offer exactly 2 options
 
   if (category === 'emergency') {
     durationMinutes = 60;
     searchHours    = 48;
-    maxOptions     = 2;
   } else if (category === 'high_value') {
     durationMinutes = 60;
     searchHours    = 5 * 24;
-    maxOptions     = 3;
   } else { // routine
     const isNewPatientCleaning = patientType === 'new' && reason.toLowerCase().includes('clean');
     durationMinutes = isNewPatientCleaning ? 75 : 60;
     searchHours    = 28 * 24;
-    maxOptions     = 3;
   }
 
   const now       = new Date();
@@ -162,6 +160,19 @@ async function getAvailableSlots(category, patientType, reason) {
     // Before opening — jump to open time
     if (current.getHours() < dayHours.open) {
       current.setHours(dayHours.open, 0, 0, 0);
+      continue;
+    }
+
+    // Time preference filtering
+    const currentHour = current.getHours();
+    if (timePreference === 'morning' && currentHour >= 12) {
+      // Already past noon — jump to next business day
+      advanceToNextBusinessOpen(current);
+      continue;
+    }
+    if (timePreference === 'afternoon' && currentHour < 12) {
+      // Before noon — jump to 12:00 PM today
+      current.setHours(12, 0, 0, 0);
       continue;
     }
 
@@ -280,6 +291,7 @@ wss.on('connection', (twilioWs) => {
   let openaiReady             = false;
   let greetingSent            = false;
   let callClosed              = false;
+  let callBooked              = false; // set to true after successful booking to stop re-triggering
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
   let pendingCallerResponse   = false;
@@ -365,14 +377,16 @@ REQUIRED FLOW (follow in exact order, never skip or reorder):
 4. Ask for their full name.
 5. Ask if they are a new or existing patient.
 6. Ask for their best callback phone number.
-7. Call check_availability with the correct category, patient type, and reason.
-8. Read out the available time slots clearly. Stop and wait for the caller to choose.
-9. Once they pick a time, call book_appointment to lock it in.
-   - If book_appointment returns SLOT_TAKEN or INVALID_SLOT, say something like:
-     "Sorry about that — that slot just got taken. Let me grab some fresh times for you."
-     Then call check_availability again and offer the new options.
-10. Confirm everything back: name, new/existing, phone number, reason, and appointment time.
-11. End warmly: "We'll see you then — have a great day!"
+7. Ask: "Do you prefer mornings or afternoons?" Wait for their answer.
+8. Call check_availability with the correct category, patient type, reason, and time_preference.
+9. Read out exactly 2 available time slots. Stop and wait for the caller to choose.
+10. Once they pick a time, call book_appointment to lock it in.
+    - If book_appointment returns SLOT_TAKEN or INVALID_SLOT, say something like:
+      "Sorry about that — that slot just got taken. Let me grab some fresh times for you."
+      Then call check_availability again and offer the new 2 options.
+11. Confirm everything back: name, new/existing, phone number, reason, and appointment time.
+12. End warmly: "We'll see you then — have a great day!"
+    After this, the call is complete. Do not respond to anything further.
 
 URGENCY TONE:
 - emergency:  respond with empathy and urgency, move fast
@@ -417,8 +431,13 @@ RULES:
                   type: 'string',
                   description: 'Brief description of why they are calling.',
                 },
+                time_preference: {
+                  type: 'string',
+                  enum: ['morning', 'afternoon', 'any'],
+                  description: 'morning = 9am-12pm, afternoon = 12pm-close, any = no preference.',
+                },
               },
-              required: ['category', 'patient_type', 'reason'],
+              required: ['category', 'patient_type', 'reason', 'time_preference'],
             },
           },
           {
@@ -484,7 +503,7 @@ RULES:
         let result;
         try {
           if (fnName === 'check_availability') {
-            const availability = await getAvailableSlots(args.category, args.patient_type, args.reason);
+            const availability = await getAvailableSlots(args.category, args.patient_type, args.reason, args.time_preference || 'any');
 
             // Store offered slots server-side so we can validate the booking later
             offeredSlots = availability.slots.map(s => ({
@@ -529,6 +548,7 @@ RULES:
                 durationMinutes: args.duration_minutes,
               });
               offeredSlots = []; // clear after a successful booking
+              callBooked   = true; // stop responding to further caller speech after booking
               result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
             }
           }
@@ -566,7 +586,7 @@ RULES:
         console.log('Assistant finished speaking');
 
         // If caller spoke while AI was still talking, respond now that AI is done
-        if (pendingCallerResponse) {
+        if (pendingCallerResponse && !callBooked) {
           pendingCallerResponse = false;
           createAssistantResponse(
             'The caller just interrupted. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow. One question at a time.'
@@ -583,11 +603,14 @@ RULES:
       if (data.type === 'input_audio_buffer.speech_stopped') {
         console.log('Caller stopped speaking');
 
+        // Once booked, don't re-trigger the flow (prevents the repeat loop)
+        if (callBooked) return;
+
         if (callerHasStartedSpeaking) {
           if (!assistantSpeaking) {
             // Normal turn: AI is silent, respond now
             createAssistantResponse(
-              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow in order: understand issue → name → new/existing → phone → check_availability → offer times → book_appointment → confirm everything. One question at a time.'
+              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow in order: understand issue → name → new/existing → phone → ask morning or afternoon preference → check_availability → offer 2 times → book_appointment → confirm everything. One question at a time.'
             );
           } else {
             // Interruption: AI is still finishing — flag it and respond once done
