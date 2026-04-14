@@ -37,6 +37,8 @@ wss.on('connection', (twilioWs) => {
   let streamSid = null;
   let openaiReady = false;
   let greetingSent = false;
+  let callClosed = false;
+  let allowCallerAudio = false;
 
   const openaiWs = new WebSocket(
     'wss://api.openai.com/v1/realtime?model=gpt-realtime',
@@ -48,149 +50,184 @@ wss.on('connection', (twilioWs) => {
     }
   );
 
+  function safeSendToOpenAI(payload) {
+    if (
+      !callClosed &&
+      openaiWs &&
+      openaiWs.readyState === WebSocket.OPEN
+    ) {
+      openaiWs.send(JSON.stringify(payload));
+    }
+  }
+
+  function safeSendToTwilio(payload) {
+    if (
+      !callClosed &&
+      twilioWs &&
+      twilioWs.readyState === WebSocket.OPEN
+    ) {
+      twilioWs.send(JSON.stringify(payload));
+    }
+  }
+
+  function sendGreeting() {
+    if (!openaiReady || !streamSid || greetingSent || callClosed) return;
+
+    greetingSent = true;
+    console.log('Triggering AI greeting');
+
+    safeSendToOpenAI({
+      type: 'response.create',
+      response: {
+        modalities: ['audio', 'text'],
+        instructions:
+          'Speak in English only. Say exactly: "Hi, thanks for calling Bright Smile Dental, how can I help you today?" Then stop speaking and wait for the caller to answer.'
+      }
+    });
+  }
+
   openaiWs.on('open', () => {
     console.log('Connected to OpenAI Realtime');
 
-    openaiWs.send(JSON.stringify({
+    safeSendToOpenAI({
       type: 'session.update',
       session: {
         modalities: ['audio', 'text'],
         instructions: `
-You are a highly skilled, friendly front desk receptionist for a dental office.
+You are a highly skilled, friendly front desk receptionist for Bright Smile Dental.
 
 You must speak in English only.
 Never switch languages.
-Never greet in another language.
-Never continue in another language unless the caller very clearly asks you to, but for this demo stay in English only.
+Never continue in another language.
+Do not say "thank you, you're welcome" to yourself or produce filler conversation.
 
-Your job is to handle incoming calls naturally, efficiently, and professionally, just like a real human receptionist.
+Your job is to handle incoming calls naturally, efficiently, and professionally, like a real human receptionist.
+
+RULES:
+- Greet first if the call has just started.
+- After the greeting, wait for the caller to speak.
+- Do not speak twice in a row unless the caller clearly asked a follow-up.
+- Ask only one question at a time.
+- Keep responses short and natural.
+- Do not repeat information the caller already gave.
+- Do not ramble.
+- Stay in English only.
+- If the caller pauses briefly, do not jump in too fast.
+- Do not invent both sides of the conversation.
 
 GOALS:
-- greet the caller first
-- then pause and wait for the caller to speak
 - understand why the caller is calling
 - guide the conversation smoothly
 - collect key information
-- move toward booking an appointment when appropriate
+- move toward booking when appropriate
 
 STYLE:
-- sound natural, calm, confident, and human
-- speak clearly and conversationally
-- keep responses short
-- ask only one question at a time
-- do not interrupt the caller
-- after your greeting, wait for the caller to answer before asking anything else
-- do not repeat information the caller already gave
-- do not ramble
-- do not switch languages
-- stay in English only
+- calm
+- warm
+- clear
+- concise
+- human
 
-GOOD PHRASES:
-- "Got it"
-- "Okay, I can help with that"
-- "No problem"
-- "Okay, that makes sense"
+If the caller mentions pain, swelling, broken tooth, or urgency, respond with empathy and prioritize urgency.
 
-CONVERSATION FLOW:
-1. Start with one short greeting in English only:
-   "Hi, thanks for calling [Practice Name], how can I help you today?"
-2. Then stop and wait for the caller to respond.
-3. Listen carefully and adapt naturally.
-4. If they mention pain, swelling, broken tooth, or urgency, respond with empathy and prioritize getting them in quickly.
-5. If they mention cleaning, checkup, or general visit, treat it as routine and move toward scheduling.
-6. If they mention cosmetic or major work, acknowledge that and guide toward a consultation.
-7. Ask only for missing information when needed:
-   - name
-   - callback number
-   - basic details about the issue
-8. Confirm key details clearly at the end.
+If the caller mentions cleaning, checkup, or general visit, treat it as routine and guide toward scheduling.
 
-IMPORTANT RULES:
-- English only
-- greet first, then wait
-- do not speak twice in a row before the caller answers
-- do not sound robotic or scripted
-- do not diagnose medical issues
-- do not mention you are an AI unless asked
+If the caller mentions cosmetic or major work, guide them toward a consultation.
 
-GOAL:
-Handle the call smoothly, sound human, stay in English, and guide toward booking efficiently.
+Only ask for missing information when needed:
+- name
+- callback number
+- issue
+- preferred time
+
+At the end, confirm key details clearly.
         `,
         voice: 'alloy',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.5,
+          threshold: 0.6,
           prefix_padding_ms: 300,
-          silence_duration_ms: 700
+          silence_duration_ms: 900
         }
       }
-    }));
+    });
 
     openaiReady = true;
+    sendGreeting();
   });
 
   openaiWs.on('message', (message) => {
-    const data = JSON.parse(message.toString());
+    try {
+      const data = JSON.parse(message.toString());
 
-    if (data.type !== 'response.audio.delta') {
-      console.log('OpenAI event:', data.type);
-    }
+      if (data.type !== 'response.audio.delta') {
+        console.log('OpenAI event:', data.type);
+      }
 
-    if (data.type === 'response.audio.delta' && data.delta && streamSid) {
-      twilioWs.send(JSON.stringify({
-        event: 'media',
-        streamSid,
-        media: {
-          payload: data.delta
+      if (data.type === 'response.audio.delta' && data.delta && streamSid) {
+        safeSendToTwilio({
+          event: 'media',
+          streamSid,
+          media: {
+            payload: data.delta
+          }
+        });
+      }
+
+      if (data.type === 'response.done') {
+        if (!allowCallerAudio && greetingSent) {
+          console.log('Greeting finished, caller audio now allowed');
+          allowCallerAudio = true;
         }
-      }));
+      }
+    } catch (error) {
+      console.error('Error parsing OpenAI message:', error.message);
     }
   });
 
   twilioWs.on('message', (message) => {
-    const data = JSON.parse(message.toString());
+    try {
+      const data = JSON.parse(message.toString());
 
-    if (data.event !== 'media') {
-      console.log('Twilio event:', data.event);
-    }
-
-    if (data.event === 'start') {
-      streamSid = data.start.streamSid;
-
-      if (!greetingSent) {
-        greetingSent = true;
-
-        setTimeout(() => {
-          if (openaiReady) {
-            console.log('Triggering AI greeting');
-
-            openaiWs.send(JSON.stringify({
-              type: 'response.create',
-              response: {
-                modalities: ['audio', 'text'],
-                instructions: 'In English only, say: "Hi, thanks for calling [Practice Name], how can I help you today?" Then stop speaking and wait for the caller to answer.'
-              }
-            }));
-          }
-        }, 500);
+      if (data.event !== 'media') {
+        console.log('Twilio event:', data.event);
       }
-    }
 
-    if (data.event === 'media') {
-      if (openaiReady) {
-        openaiWs.send(JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: data.media.payload
-        }));
+      if (data.event === 'start') {
+        streamSid = data.start.streamSid;
+        sendGreeting();
       }
+
+      if (data.event === 'media') {
+        if (openaiReady && allowCallerAudio) {
+          safeSendToOpenAI({
+            type: 'input_audio_buffer.append',
+            audio: data.media.payload
+          });
+        }
+      }
+
+      if (data.event === 'stop') {
+        console.log('Twilio stream stopped');
+      }
+    } catch (error) {
+      console.error('Error parsing Twilio message:', error.message);
     }
   });
 
   twilioWs.on('close', () => {
+    callClosed = true;
     console.log('Call ended');
-    openaiWs.close();
+
+    if (
+      openaiWs &&
+      (openaiWs.readyState === WebSocket.OPEN ||
+        openaiWs.readyState === WebSocket.CONNECTING)
+    ) {
+      openaiWs.close();
+    }
   });
 
   openaiWs.on('close', () => {
