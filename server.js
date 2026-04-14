@@ -40,9 +40,10 @@ wss.on('connection', (twilioWs) => {
   let callClosed = false;
   let assistantSpeaking = false;
   let callerHasStartedSpeaking = false;
+  let pendingCallerResponse = false; // FIX: handles interruption case where caller speaks while AI is still talking
 
   const openaiWs = new WebSocket(
-    'wss://api.openai.com/v1/realtime?model=gpt-realtime',
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview', // FIX: corrected model name (was 'gpt-realtime' which doesn't exist)
     {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -68,6 +69,7 @@ wss.on('connection', (twilioWs) => {
 
     assistantSpeaking = true;
     callerHasStartedSpeaking = false;
+    pendingCallerResponse = false; // FIX: always clear pending flag when we start a new response
 
     safeSendToOpenAI({
       type: 'response.create',
@@ -136,8 +138,7 @@ STYLE:
 RULES:
 - ask only one question at a time
 - do not ask for full name or phone number before you understand their issue
-- do not move into booking before you have:
-  issue + full name + phone number
+- do not move into booking before you have: issue + full name + phone number
 - after asking whether a time works, wait for the caller's answer
 - do not ask another question until the caller responds
 - if the caller pauses briefly, wait rather than jumping in
@@ -196,23 +197,40 @@ Do not continue the script on your own.
       if (data.type === 'response.done') {
         assistantSpeaking = false;
         console.log('Assistant finished speaking');
+
+        // FIX: if the caller spoke and stopped while the AI was still talking (interruption),
+        // now that the AI response is fully done/cancelled, trigger the response to what the caller said
+        if (pendingCallerResponse) {
+          pendingCallerResponse = false;
+          createAssistantResponse(
+            'The caller just interrupted you. Respond in English only as the dental receptionist. Continue naturally based on what the caller said. Ask only one question at a time and wait for the caller to respond.'
+          );
+        }
       }
 
+      // FIX: removed the 'if (!assistantSpeaking)' guard here.
+      // We need to always track when the caller starts speaking — including interruptions.
+      // Previously, if the AI was talking, this flag never got set, so interruptions were silently ignored.
       if (data.type === 'input_audio_buffer.speech_started') {
-        if (!assistantSpeaking) {
-          callerHasStartedSpeaking = true;
-          console.log('Caller started speaking');
-        }
+        callerHasStartedSpeaking = true;
+        console.log('Caller started speaking');
       }
 
       if (data.type === 'input_audio_buffer.speech_stopped') {
         console.log('Caller stopped speaking');
 
-        // ONLY respond if there was a real caller speech start first
-        if (!assistantSpeaking && callerHasStartedSpeaking) {
-          createAssistantResponse(
-            'Respond in English only as the dental office receptionist. Continue naturally from the caller’s last message. If you do not yet know their issue, ask about it. If you know their issue but do not yet have their full name, ask for their full name. If you have their issue and full name but not their phone number, ask for their best callback phone number. Only after you have the issue, full name, and phone number should you move to booking. If you offer appointment times, stop speaking afterward and wait for the caller’s answer.'
-          );
+        if (callerHasStartedSpeaking) {
+          if (!assistantSpeaking) {
+            // Normal case: AI is already silent, respond immediately
+            createAssistantResponse(
+              'Respond in English only as the dental office receptionist. Continue naturally from the caller\'s last message. Follow the session instructions: understand the issue first, then collect full name, then phone number, then move to booking. Ask only one question at a time and stop speaking after you ask it.'
+            );
+          } else {
+            // FIX: Interruption case — the AI is still finishing up (or being cancelled).
+            // Set the pending flag and we will respond once response.done fires above.
+            pendingCallerResponse = true;
+            console.log('Caller interrupted — will respond after current AI response finishes');
+          }
         }
       }
 
