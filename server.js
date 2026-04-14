@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const twilio = require('twilio');
+const WebSocket = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,15 +17,29 @@ app.get('/', (req, res) => {
 app.post('/voice', (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  twiml.say('Hello. Thanks for calling. Our voice assistant is currently being set up. Please leave a message after the tone.');
-
-  twiml.pause({ length: 1 });
-  twiml.say('Goodbye.');
+  twiml.connect().stream({
+    url: `wss://${req.headers.host}/ws`
+  });
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('Twilio connected to WebSocket');
+
+  ws.on('message', (message) => {
+    const data = JSON.parse(message);
+    console.log('Received event:', data.event);
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket closed');
+  });
 });
