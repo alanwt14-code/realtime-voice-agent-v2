@@ -104,7 +104,7 @@ function formatSlotForSpeech(date) {
 // high_value — within 5 days, 60 min consult, 3 options (spread across days)
 // routine    — up to 4 weeks, 60 min (75 min for new patient cleaning), 3 options
 // ─────────────────────────────────────────────────────────────────────────────
-async function getAvailableSlots(category, patientType, reason, timePreference = 'any') {
+async function getAvailableSlots(category, patientType, reason, timePreference = 'any', daysOffset = 0) {
   let durationMinutes, searchHours;
   const maxOptions = 2; // Always offer exactly 2 options
 
@@ -119,10 +119,23 @@ async function getAvailableSlots(category, patientType, reason, timePreference =
     searchHours = 28 * 24;
   }
 
-  const now       = new Date();
+  const now = new Date();
+
+  // If caller requested a future week/date, shift the search window forward.
+  // searchStart = the later of (now) or (now + daysOffset days at midnight).
+  // searchEnd extends searchHours from searchStart so we still scan a full window.
+  let searchStart = new Date(now);
+  if (daysOffset > 0) {
+    searchStart = new Date(now);
+    searchStart.setDate(searchStart.getDate() + daysOffset);
+    searchStart.setHours(0, 0, 0, 0); // start of that day
+    // If the requested start is already past the normal search window, extend it
+    const minEnd = new Date(searchStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+    searchHours  = Math.max(searchHours, (minEnd - now) / (60 * 60 * 1000));
+  }
   const searchEnd = new Date(now.getTime() + searchHours * 60 * 60 * 1000);
 
-  // Fetch busy times from Google Calendar
+  // Fetch busy times from Google Calendar (always query from now so we have full context)
   const freebusyRes = await calendarClient.freebusy.query({
     requestBody: {
       timeMin: now.toISOString(),
@@ -136,13 +149,23 @@ async function getAvailableSlots(category, patientType, reason, timePreference =
     end:   new Date(b.end),
   }));
 
-  // Build starting point
-  const current = new Date(now);
-  if (category === 'emergency') {
-    // Give a 30-minute buffer so we can actually prepare
-    current.setTime(current.getTime() + 30 * 60 * 1000);
+  // Build starting point — use searchStart (respects daysOffset)
+  const current = new Date(searchStart);
+  if (daysOffset === 0 && category === 'emergency') {
+    // Give a 30-minute buffer for same-day emergencies
+    current.setTime(Math.max(current.getTime(), now.getTime() + 30 * 60 * 1000));
   }
-  snapToNext30(current);
+  if (daysOffset === 0) {
+    snapToNext30(current);
+  } else {
+    // Jump straight to the first open business hour on or after searchStart
+    const h = BUSINESS_HOURS[current.getDay()];
+    if (!h) {
+      advanceToNextBusinessOpen(current);
+    } else {
+      current.setHours(h.open, 0, 0, 0);
+    }
+  }
 
   const slots = [];
   let safety   = 0;
@@ -315,8 +338,14 @@ STEP 3 — Ask: "Can I get your full name?" (you need first AND last name — al
 STEP 4 — Ask: "Are you a new or existing patient?"
 
 STEP 5 — Ask: "Do you prefer morning or afternoon appointments?"
+         Also listen for any time window preference they mention (e.g. "next week", "not until next week", "in two weeks").
+         You do NOT need to ask a separate question for this — just note it if they say it.
 
-STEP 6 — Call check_availability with the correct category, patient_type, reason, and time_preference.
+STEP 6 — Call check_availability with the correct category, patient_type, reason, time_preference,
+         and days_offset if they mentioned a future week:
+         • "next week" or "not until next week" → days_offset: 7
+         • "in two weeks" → days_offset: 14
+         • No preference / "as soon as possible" → days_offset: 0 (default)
 
 STEP 7 — Read the 2 available time options aloud. Ask which works better.
          STOP. Wait for the caller to pick a specific time.
@@ -470,6 +499,10 @@ wss.on('connection', (twilioWs) => {
                   enum: ['morning', 'afternoon', 'any'],
                   description: 'morning = 7am-12pm, afternoon = 12pm-4pm, any = no preference.',
                 },
+                days_offset: {
+                  type: 'number',
+                  description: 'How many days from today to start searching. Use 0 (default) for soonest available. Use 7 for "next week", 14 for "in two weeks", etc. If the caller says "next week" or "not until next week", set this to 7. If they say "in two weeks", set to 14.',
+                },
               },
               required: ['category', 'patient_type', 'reason', 'time_preference'],
             },
@@ -537,7 +570,7 @@ wss.on('connection', (twilioWs) => {
         let result;
         try {
           if (fnName === 'check_availability') {
-            const availability = await getAvailableSlots(args.category, args.patient_type, args.reason, args.time_preference || 'any');
+            const availability = await getAvailableSlots(args.category, args.patient_type, args.reason, args.time_preference || 'any', args.days_offset || 0);
 
             // Store offered slots server-side so we can validate the booking later
             offeredSlots = availability.slots.map(s => ({
