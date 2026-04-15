@@ -600,7 +600,7 @@ wss.on('connection', (twilioWs) => {
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              'The appointment is confirmed and in the calendar. Read back the full confirmation to the caller: their name, whether they are new or existing, their phone number, the reason for the visit, and the appointment date and time. Then say "We\'ll see you then — have a great day!" Do not call any more tools. The call is finished.'
+              'The appointment is confirmed and in the calendar. Read back the summary: their name, new or existing patient, reason for visit, and appointment date and time. Then ask: "Is the number you\'re calling from the best way to reach you?" — if yes, say "Perfect — we\'ll see you then, have a great day!" and end the call. If no, ask "What\'s the best number to reach you?" wait for their answer, then say "Got it — we\'ll see you then, have a great day!" and end the call. Do not call any more tools.'
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
