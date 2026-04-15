@@ -108,16 +108,15 @@ async function getAvailableSlots(category, patientType, reason, timePreference =
   let durationMinutes, searchHours;
   const maxOptions = 2; // Always offer exactly 2 options
 
+  // All appointments are 60 minutes regardless of category or patient type
+  durationMinutes = 60;
+
   if (category === 'emergency') {
-    durationMinutes = 60;
-    searchHours    = 48;
+    searchHours = 48;
   } else if (category === 'high_value') {
-    durationMinutes = 60;
-    searchHours    = 5 * 24;
+    searchHours = 5 * 24;
   } else { // routine
-    const isNewPatientCleaning = patientType === 'new' && reason.toLowerCase().includes('clean');
-    durationMinutes = isNewPatientCleaning ? 75 : 60;
-    searchHours    = 28 * 24;
+    searchHours = 28 * 24;
   }
 
   const now       = new Date();
@@ -414,9 +413,9 @@ wss.on('connection', (twilioWs) => {
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.75,
-          prefix_padding_ms: 300,
-          silence_duration_ms: 1100,
+          threshold: 0.5,
+          prefix_padding_ms: 200,
+          silence_duration_ms: 600,
           create_response: false,
           interrupt_response: true,
         },
@@ -600,7 +599,7 @@ wss.on('connection', (twilioWs) => {
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              'The appointment is confirmed and in the calendar. Read back the summary: their name, new or existing patient, reason for visit, and appointment date and time. Then ask: "Is the number you\'re calling from the best way to reach you?" — if yes, say "Perfect — we\'ll see you then, have a great day!" and end the call. If no, ask "What\'s the best number to reach you?" wait for their answer, then say "Got it — we\'ll see you then, have a great day!" and end the call. Do not call any more tools.'
+              `The appointment is confirmed. Read back the summary: their name, new or existing patient, reason for visit, and appointment date and time. Then say: "I also have ${phoneToUse} as your contact number — is that the best way to reach you?" If yes, say "Perfect — we'll see you then, have a great day!" and end the call. If no, ask "What's the best number?" wait for their answer, then say "Got it — we'll see you then, have a great day!" and end the call. Do not call any more tools.`
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
@@ -619,7 +618,7 @@ wss.on('connection', (twilioWs) => {
         console.log('Assistant finished speaking');
 
         // If caller spoke while AI was still talking, respond now that AI is done
-        if (pendingCallerResponse && !callBooked) {
+        if (pendingCallerResponse) {
           pendingCallerResponse = false;
           createAssistantResponse(
             'The caller just interrupted. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow. One question at a time.'
@@ -636,8 +635,8 @@ wss.on('connection', (twilioWs) => {
       if (data.type === 'input_audio_buffer.speech_stopped') {
         console.log('Caller stopped speaking');
 
-        // Once booked, don't re-trigger the flow (prevents the repeat loop)
-        if (callBooked) return;
+        // Once booked, only allow responses for the phone confirmation — block tool-triggering responses after that
+        // (tool re-booking is blocked separately in the tool execution block)
 
         if (callerHasStartedSpeaking) {
           if (!assistantSpeaking) {
