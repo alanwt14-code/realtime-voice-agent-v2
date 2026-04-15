@@ -309,10 +309,11 @@ REQUIRED FLOW (follow in exact order, never skip or reorder):
 6. Ask: "Do you prefer mornings or afternoons?" Wait for their answer.
 7. Call check_availability with the correct category, patient_type, reason, and time_preference.
 8. Offer exactly 2 time slots. Stop and wait for the caller to pick one.
-9. Once they pick a time, confirm the phone number BEFORE booking:
-   Say: "I have ${callerPhone ? callerPhone : 'your number on file'} as your contact — is that the best way to reach you?"
-   - If yes: use ${callerPhone || 'that number'} as the phone when calling book_appointment.
-   - If no: ask "What's the best number?" wait for their answer, use that number when calling book_appointment.
+9. Once they pick a time, say EXACTLY this: "I have ${callerPhone || 'your number on file'} — is that the best number to reach you?"
+   Then STOP and wait for their answer.
+   - If they say YES: call book_appointment using phone="${callerPhone || 'on file'}".
+   - If they say NO: ask "What number would you prefer?" Wait for their answer. Then call book_appointment using that number.
+   Do NOT ask "what's your number" — only ask if they say no.
 10. Call book_appointment with the confirmed phone number, full name, reason, category, patient_type, datetime, duration_minutes.
 11. After booking confirms, say: "[Full name], you're all set — we have you down for [reason] on [date and time]. We'll see you then, have a great day!"
 12. Call is complete. Do not say anything further.
@@ -324,7 +325,8 @@ URGENCY TONE:
 
 RULES:
 - One question at a time. Wait for the answer before continuing.
-- NEVER ask for a phone number mid-call. Confirm it at step 9 only.
+- NEVER ask for a phone number unprompted. Only confirm it at step 9.
+- At step 9, ask yes/no FIRST. Only ask for a new number if they say no.
 - Always ask for FULL name — first and last.
 - Never call book_appointment before the phone number is confirmed at step 9.
 - Do not diagnose medical conditions.
@@ -415,9 +417,9 @@ wss.on('connection', (twilioWs) => {
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.5,
-          prefix_padding_ms: 200,
-          silence_duration_ms: 600,
+          threshold: 0.7,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 800,
           create_response: false,
           interrupt_response: true,
         },
