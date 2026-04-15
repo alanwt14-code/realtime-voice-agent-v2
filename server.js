@@ -47,11 +47,11 @@ const calendarClient = google.calendar({ version: 'v3', auth: calendarAuth });
 // ─────────────────────────────────────────────────────────────────────────────
 const BUSINESS_HOURS = {
   0: null,                     // Sunday  — closed
-  1: { open: 9, close: 17 },  // Monday
-  2: { open: 9, close: 17 },  // Tuesday
-  3: { open: 9, close: 17 },  // Wednesday
-  4: { open: 9, close: 17 },  // Thursday
-  5: { open: 9, close: 17 },  // Friday
+  1: { open: 7, close: 16 },  // Monday
+  2: { open: 7, close: 16 },  // Tuesday
+  3: { open: 7, close: 16 },  // Wednesday
+  4: { open: 7, close: 16 },  // Thursday
+  5: { open: 7, close: 16 },  // Friday
   6: { open: 9, close: 14 },  // Saturday
 };
 
@@ -289,47 +289,68 @@ const server = app.listen(PORT, () => console.log(`Server running on port ${PORT
 // Build session instructions (called once at open, updated when caller number arrives)
 // ─────────────────────────────────────────────────────────────────────────────
 function buildSessionInstructions(callerPhone) {
+  const displayPhone = callerPhone || 'the number you called from';
   return `
-You are a friendly, professional front desk receptionist for Bright Smile Dental.
-Speak in English only. Never invent the caller's side of the conversation.
+You are a friendly, professional dental receptionist for Bright Smile Dental.
+Speak English only. Never invent the caller's side of the conversation.
 
 VISIT CATEGORIES:
 - emergency  (#1 priority): tooth pain, swelling, broken tooth, bleeding, infection, trauma, abscess
 - high_value (#2 priority): implants, cosmetics, veneers, Invisalign, whitening, smile makeover
 - routine    (#3 priority): checkup, cleaning, x-rays, general exam, fillings
 
-REQUIRED FLOW (follow in exact order, never skip or reorder):
-1. Greet and ask how you can help.
-2. Listen and understand their reason for calling.
-3. If EMERGENCY: ask exactly ONE follow-up question — pick the most relevant:
-   "Are you in any pain right now?" / "Is there any swelling?" / "How long has this been going on?"
-   Only one. Then move on.
-4. Ask for their full name. Always ask for FULL name (first and last).
-5. Ask if they are a new or existing patient.
-6. Ask: "Do you prefer mornings or afternoons?" Wait for their answer.
-7. Call check_availability with the correct category, patient_type, reason, and time_preference.
-8. Offer exactly 2 time slots. Stop and wait for the caller to pick one.
-9. Once they pick a time, say EXACTLY this: "I have ${callerPhone || 'your number on file'} — is that the best number to reach you?"
-   Then STOP and wait for their answer.
-   - If they say YES: call book_appointment using phone="${callerPhone || 'on file'}".
-   - If they say NO: ask "What number would you prefer?" Wait for their answer. Then call book_appointment using that number.
-   Do NOT ask "what's your number" — only ask if they say no.
-10. Call book_appointment with the confirmed phone number, full name, reason, category, patient_type, datetime, duration_minutes.
-11. After booking confirms, say: "[Full name], you're all set — we have you down for [reason] on [date and time]. We'll see you then, have a great day!"
-12. Call is complete. Do not say anything further.
+════════════════════════════════════════════
+EXACT FLOW — follow every step in order:
+════════════════════════════════════════════
 
-URGENCY TONE:
-- emergency:  empathy and urgency, move fast
-- high_value: warm and attentive
+STEP 1 — Greet: "Hi, thanks for calling Bright Smile Dental, how can I help you today?"
+         Wait for them to explain why they're calling.
+
+STEP 2 — If EMERGENCY: ask EXACTLY ONE follow-up (choose the most relevant):
+         "Are you in any pain right now?" or "Is there any swelling?" or "How long has this been going on?"
+         Only ONE question. Then move on.
+
+STEP 3 — Ask: "Can I get your full name?" (you need first AND last name — always ask for full name)
+
+STEP 4 — Ask: "Are you a new or existing patient?"
+
+STEP 5 — Ask: "Do you prefer morning or afternoon appointments?"
+
+STEP 6 — Call check_availability with the correct category, patient_type, reason, and time_preference.
+
+STEP 7 — Read the 2 available time options aloud. Ask which works better.
+         STOP. Wait for the caller to pick a specific time.
+
+STEP 8 — PHONE CONFIRMATION (do this BEFORE calling book_appointment):
+         Say: "I have ${displayPhone} as the best number to reach you — is that correct?"
+         STOP. Wait for yes or no.
+         • If YES → go to Step 9 using ${displayPhone}.
+         • If NO  → ask "What number would you prefer we use?" Wait for their answer.
+                    Use the number they give you in Step 9.
+
+STEP 9 — NOW call book_appointment with:
+         name (full), phone (confirmed in Step 8), reason, category, patient_type,
+         datetime (exact ISO string from the slots array), duration_minutes.
+
+STEP 10 — After booking is confirmed, give the closing summary:
+          "[Full name], you're all set! We have you booked for [reason] on [day] at [time].
+           We'll reach you at [confirmed phone number]. We'll see you then — have a great day!"
+          Then stop. Do not say anything else.
+
+════════════════════════════════════════════
+CRITICAL RULES — never break these:
+════════════════════════════════════════════
+- NEVER ask for a phone number during Steps 1–7. No phone questions before Step 8.
+- NEVER call book_appointment before completing Step 8 (phone confirmation).
+- ONE question at a time — wait for the answer before asking the next.
+- Always collect FULL name (first and last).
+- At Step 8 ask yes/no FIRST. Only ask for a new number if they say no.
+- Do not diagnose conditions. Do not offer medical advice.
+
+TONE:
+- emergency:  warm empathy, move efficiently
+- high_value: warm, attentive, unhurried
 - routine:    relaxed and friendly
-
-RULES:
-- One question at a time. Wait for the answer before continuing.
-- NEVER ask for a phone number unprompted. Only confirm it at step 9.
-- At step 9, ask yes/no FIRST. Only ask for a new number if they say no.
-- Always ask for FULL name — first and last.
-- Never call book_appointment before the phone number is confirmed at step 9.
-- Do not diagnose medical conditions.
   `;
 }
 
@@ -427,7 +448,7 @@ wss.on('connection', (twilioWs) => {
           {
             type: 'function',
             name: 'check_availability',
-            description: 'Check available appointment slots based on visit category. Call this only after you have collected the reason, full name, new/existing status, and phone number.',
+            description: 'Check available appointment slots. Call this after collecting: reason for visit, full name, new/existing status, and morning/afternoon preference. Do NOT wait for phone number — that is confirmed later.',
             parameters: {
               type: 'object',
               properties: {
@@ -447,7 +468,7 @@ wss.on('connection', (twilioWs) => {
                 time_preference: {
                   type: 'string',
                   enum: ['morning', 'afternoon', 'any'],
-                  description: 'morning = 9am-12pm, afternoon = 12pm-close, any = no preference.',
+                  description: 'morning = 7am-12pm, afternoon = 12pm-4pm, any = no preference.',
                 },
               },
               required: ['category', 'patient_type', 'reason', 'time_preference'],
@@ -596,8 +617,9 @@ wss.on('connection', (twilioWs) => {
         // Give the AI explicit instructions for what to do next based on the tool result
         if (fnName === 'check_availability') {
           if (result.success) {
+            const phoneDisplay = callerPhoneNumber || 'the number you called from';
             createAssistantResponse(
-              'The calendar has been checked. Read the formatted_slots to the caller — offer exactly the 2 options listed. Say something like "I have [slot 1] or [slot 2], which works better for you?" Then stop talking and wait for their answer. Do NOT book yet. When the caller picks a time, use the exact ISO datetime string from the slots array when calling book_appointment.'
+              `The calendar has been checked. Read the formatted_slots to the caller — offer exactly the 2 options. Say something like "I have [slot 1] or [slot 2] — which works better for you?" Then STOP and wait for their answer.\n\nONCE they pick a time, do NOT call book_appointment yet. First confirm the phone number by saying: "I have ${phoneDisplay} as the best number to reach you — is that correct?" Then STOP and wait for yes or no.\n• If yes → call book_appointment using phone="${phoneDisplay}".\n• If no  → ask "What number would you like us to use?" Wait for their answer, then call book_appointment using that number.\n\nNever call book_appointment before the phone is confirmed. Use the exact ISO datetime string from the slots array.`
             );
           } else {
             createAssistantResponse(
@@ -629,7 +651,7 @@ wss.on('connection', (twilioWs) => {
         if (pendingCallerResponse) {
           pendingCallerResponse = false;
           createAssistantResponse(
-            'The caller just interrupted. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow. One question at a time.'
+            'The caller just spoke. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow: issue → full name → new/existing → morning/afternoon → check_availability → offer 2 times → pick a time → THEN confirm phone → book_appointment → summary. Never ask for phone number before they have picked a time. One question at a time.'
           );
         }
       }
@@ -650,7 +672,7 @@ wss.on('connection', (twilioWs) => {
           if (!assistantSpeaking) {
             // Normal turn: AI is silent, respond now
             createAssistantResponse(
-              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow: understand issue → full name (first and last) → new/existing → morning or afternoon preference → check_availability → offer 2 times → confirm phone number → book_appointment → closing summary. Never ask for a phone number mid-call. One question at a time.'
+              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow in order: understand issue → full name (first and last) → new/existing → morning or afternoon preference → call check_availability → offer 2 time slots → wait for them to pick one → THEN confirm phone number → call book_appointment → closing summary with phone number included. NEVER ask for a phone number before they have picked a time slot. One question at a time.'
             );
           } else {
             // Interruption: AI is still finishing — flag it and respond once done
