@@ -486,9 +486,9 @@ wss.on('connection', (twilioWs) => {
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.7,
+          threshold: 0.8,
           prefix_padding_ms: 300,
-          silence_duration_ms: 800,
+          silence_duration_ms: 900,
           create_response: false,
           interrupt_response: true,
         },
@@ -696,7 +696,8 @@ wss.on('connection', (twilioWs) => {
       }
 
       if (data.type === 'response.done') {
-        assistantSpeaking = false;
+        assistantSpeaking        = false;
+        callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
         // If caller spoke while AI was still talking, respond now that AI is done
