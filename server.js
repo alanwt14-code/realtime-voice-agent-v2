@@ -271,13 +271,79 @@ async function createAppointment({ name, phone, reason, category, patientType, d
 app.get('/', (req, res) => res.send('Realtime Voice Agent V2 is running'));
 
 app.post('/voice', (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-  twiml.connect().stream({ url: `wss://${req.headers.host}/ws` });
+  const twiml   = new twilio.twiml.VoiceResponse();
+  const connect = twiml.connect();
+  const stream  = connect.stream({ url: `wss://${req.headers.host}/ws` });
+
+  // Pass the caller's phone number into the WebSocket session as a custom parameter
+  if (req.body.From) {
+    stream.parameter({ name: 'callerNumber', value: req.body.From });
+  }
+
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Build session instructions (called once at open, updated when caller number arrives)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildSessionInstructions(callerPhone) {
+  const phoneInstructions = callerPhone
+    ? `
+CALLER PHONE NUMBER: You already have the caller's number from their caller ID: ${callerPhone}.
+- Do NOT ask for their phone number during the call.
+- After the caller picks an appointment time and BEFORE calling book_appointment, say:
+  "I have your number as ${callerPhone} — is that the best number to reach you?"
+- If they say yes: use ${callerPhone} as the phone number when calling book_appointment.
+- If they say no: ask "What's the best number?" and use their answer instead.`
+    : `
+- Ask for their best callback phone number as step 6 in the flow.`;
+
+  return `
+You are a friendly, professional front desk receptionist for Bright Smile Dental.
+Speak in English only. Never invent the caller's side of the conversation.
+
+VISIT CATEGORIES:
+- emergency  (#1 priority): tooth pain, swelling, broken tooth, bleeding, infection, trauma, abscess
+- high_value (#2 priority): implants, cosmetics, veneers, Invisalign, whitening, smile makeover
+- routine    (#3 priority): checkup, cleaning, x-rays, general exam, fillings
+
+REQUIRED FLOW (follow in exact order, never skip or reorder):
+1. Greet and ask how you can help.
+2. Listen and understand their reason for calling.
+3. If the reason is an EMERGENCY: ask exactly ONE follow-up question to understand urgency.
+   Pick the most relevant one based on what they said:
+   - "Are you in any pain right now?"
+   - "Is there any swelling?"
+   - "How long has this been going on?"
+   Only ask one. Then move on.
+4. Ask for their full name.
+5. Ask if they are a new or existing patient.
+${phoneInstructions}
+6. Ask: "Do you prefer mornings or afternoons?" Wait for their answer.
+7. Call check_availability with the correct category, patient type, reason, and time_preference.
+8. Read out exactly 2 available time slots. Stop and wait for the caller to choose.
+9. Once they pick a time, confirm the phone number (see CALLER PHONE NUMBER instructions above).
+10. Call book_appointment to lock it in.
+    - If book_appointment returns SLOT_TAKEN, say: "Sorry — that time just got taken. Let me find fresh options." Then call check_availability again.
+11. Confirm everything back: name, new/existing, confirmed phone number, reason, and appointment time.
+12. End warmly: "We'll see you then — have a great day!"
+    After this, the call is complete. Do not respond to anything further.
+
+URGENCY TONE:
+- emergency:  respond with empathy and urgency, move fast
+- high_value: warm and attentive, treat as a priority
+- routine:    relaxed and friendly
+
+RULES:
+- One question at a time. Stop after asking. Wait for the answer.
+- Never move to the next step until the previous one is answered.
+- Never book without confirmed phone number, name, new/existing status, and issue.
+- Do not diagnose medical conditions.
+  `;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WebSocket bridge: Twilio <-> OpenAI Realtime
@@ -288,10 +354,11 @@ wss.on('connection', (twilioWs) => {
   console.log('Twilio connected');
 
   let streamSid               = null;
+  let callerPhoneNumber       = null; // populated from Twilio caller ID
   let openaiReady             = false;
   let greetingSent            = false;
   let callClosed              = false;
-  let callBooked              = false; // set to true after successful booking to stop re-triggering
+  let callBooked              = false;
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
   let pendingCallerResponse   = false;
@@ -356,49 +423,7 @@ wss.on('connection', (twilioWs) => {
       type: 'session.update',
       session: {
         modalities: ['audio', 'text'],
-        instructions: `
-You are a friendly, professional front desk receptionist for Bright Smile Dental.
-Speak in English only. Never invent the caller's side of the conversation.
-
-VISIT CATEGORIES:
-- emergency  (#1 priority): tooth pain, swelling, broken tooth, bleeding, infection, trauma, abscess
-- high_value (#2 priority): implants, cosmetics, veneers, Invisalign, whitening, smile makeover
-- routine    (#3 priority): checkup, cleaning, x-rays, general exam, fillings
-
-REQUIRED FLOW (follow in exact order, never skip or reorder):
-1. Greet and ask how you can help.
-2. Listen and understand their reason for calling.
-3. If the reason is an EMERGENCY: ask exactly ONE follow-up question to understand urgency.
-   Pick the most relevant one based on what they said:
-   - "Are you in any pain right now?"
-   - "Is there any swelling?"
-   - "How long has this been going on?"
-   Only ask one. Then move on.
-4. Ask for their full name.
-5. Ask if they are a new or existing patient.
-6. Ask for their best callback phone number.
-7. Ask: "Do you prefer mornings or afternoons?" Wait for their answer.
-8. Call check_availability with the correct category, patient type, reason, and time_preference.
-9. Read out exactly 2 available time slots. Stop and wait for the caller to choose.
-10. Once they pick a time, call book_appointment to lock it in.
-    - If book_appointment returns SLOT_TAKEN or INVALID_SLOT, say something like:
-      "Sorry about that — that slot just got taken. Let me grab some fresh times for you."
-      Then call check_availability again and offer the new 2 options.
-11. Confirm everything back: name, new/existing, phone number, reason, and appointment time.
-12. End warmly: "We'll see you then — have a great day!"
-    After this, the call is complete. Do not respond to anything further.
-
-URGENCY TONE:
-- emergency:  respond with empathy and urgency, move fast
-- high_value: warm and attentive, treat as a priority
-- routine:    relaxed and friendly
-
-RULES:
-- One question at a time. Stop after asking. Wait for the answer.
-- Never move to the next step until the previous one is answered.
-- Never book without all of: issue + name + new/existing status + phone number.
-- Do not diagnose medical conditions.
-        `,
+        instructions: buildSessionInstructions(null), // updated with caller number after Twilio start event
         voice: 'alloy',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
@@ -657,7 +682,21 @@ RULES:
       }
 
       if (data.event === 'start') {
-        streamSid = data.start.streamSid;
+        streamSid         = data.start.streamSid;
+        callerPhoneNumber = data.start.customParameters?.callerNumber || null;
+        console.log('Caller number:', callerPhoneNumber || 'unknown');
+
+        // Now that we have the caller's number, update the session instructions
+        // so the AI knows to skip asking for it and confirm it at the end instead
+        if (callerPhoneNumber && openaiReady) {
+          safeSendToOpenAI({
+            type: 'session.update',
+            session: {
+              instructions: buildSessionInstructions(callerPhoneNumber),
+            },
+          });
+        }
+
         sendGreeting();
       }
 
