@@ -419,7 +419,8 @@ wss.on('connection', (twilioWs) => {
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
-  let hangupAfterResponse     = false; // set after booking confirmed — hang up on next response.done
+  let hangupAfterResponse     = false; // hang up when closing summary response.done fires
+  let skipHangupOnce          = false; // skip the tool-call response.done — only hang up after the summary
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
 
@@ -649,7 +650,8 @@ wss.on('connection', (twilioWs) => {
             });
             offeredSlots        = [];
             callBooked          = true;
-            hangupAfterResponse = true; // hang up once the closing summary is spoken
+            hangupAfterResponse = true; // hang up after closing summary
+            skipHangupOnce      = true; // skip the tool-call response.done — wait for the summary response.done
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
           }
         } catch (err) {
@@ -713,19 +715,24 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
-        // Hang up automatically after the closing summary is spoken
-        if (hangupAfterResponse && callSid) {
-          hangupAfterResponse = false;
-          console.log('Hanging up call:', callSid);
-          setTimeout(async () => {
-            try {
-              await twilioClient.calls(callSid).update({ status: 'completed' });
-              console.log('Call ended successfully');
-            } catch (err) {
-              console.error('Failed to hang up call:', err.message);
-            }
-          }, 1000); // 1-second pause so the last word isn't clipped
-          return;
+        // Hang up automatically after the closing summary is spoken.
+        // skipHangupOnce skips the tool-call response.done so we wait for the summary response.done.
+        if (hangupAfterResponse) {
+          if (skipHangupOnce) {
+            skipHangupOnce = false; // this was the tool-call response.done — let it pass
+          } else if (callSid) {
+            hangupAfterResponse = false;
+            console.log('Closing summary done — hanging up call:', callSid);
+            setTimeout(async () => {
+              try {
+                await twilioClient.calls(callSid).update({ status: 'completed' });
+                console.log('Call ended successfully');
+              } catch (err) {
+                console.error('Failed to hang up call:', err.message);
+              }
+            }, 1000); // 1-second pause so the last word isn't clipped
+            return;
+          }
         }
 
         // If caller spoke while AI was still talking, respond now that AI is done
