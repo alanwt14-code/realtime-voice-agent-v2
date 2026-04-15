@@ -419,8 +419,8 @@ wss.on('connection', (twilioWs) => {
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
-  let hangupAfterResponse     = false; // hang up when closing summary response.done fires
-  let skipHangupOnce          = false; // skip the tool-call response.done — only hang up after the summary
+  let hangupArmed             = false; // true after booking succeeds — waiting for closing summary
+  let hangupReady             = false; // true after closing summary starts — next response.done hangs up
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
 
@@ -648,10 +648,9 @@ wss.on('connection', (twilioWs) => {
               datetime:        datetimeToBook,
               durationMinutes: durationToBook,
             });
-            offeredSlots        = [];
-            callBooked          = true;
-            hangupAfterResponse = true; // hang up after closing summary
-            skipHangupOnce      = true; // skip the tool-call response.done — wait for the summary response.done
+            offeredSlots = [];
+            callBooked   = true;
+            hangupArmed  = true; // arm the hangup — will fire after closing summary plays
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
           }
         } catch (err) {
@@ -715,24 +714,37 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
-        // Hang up automatically after the closing summary is spoken.
-        // skipHangupOnce skips the tool-call response.done so we wait for the summary response.done.
-        if (hangupAfterResponse) {
-          if (skipHangupOnce) {
-            skipHangupOnce = false; // this was the tool-call response.done — let it pass
-          } else if (callSid) {
-            hangupAfterResponse = false;
-            console.log('Closing summary done — hanging up call:', callSid);
+        // Two-stage hangup:
+        // Stage 1 — hangupArmed: booking just succeeded, closing summary was just triggered.
+        //           This response.done is from the tool-call response. Advance to stage 2.
+        // Stage 2 — hangupReady: closing summary just finished playing. Hang up now.
+        if (hangupReady) {
+          hangupReady = false;
+          console.log('Closing summary done — hanging up');
+          if (callSid) {
             setTimeout(async () => {
               try {
                 await twilioClient.calls(callSid).update({ status: 'completed' });
                 console.log('Call ended successfully');
               } catch (err) {
-                console.error('Failed to hang up call:', err.message);
+                console.error('Failed to hang up via REST:', err.message);
+                // Fallback: close the WebSocket so Twilio drops the call
+                twilioWs.close();
               }
-            }, 1000); // 1-second pause so the last word isn't clipped
-            return;
+            }, 1000);
+          } else {
+            // No callSid — close WebSocket as fallback
+            setTimeout(() => twilioWs.close(), 1000);
           }
+          return;
+        }
+
+        if (hangupArmed) {
+          // Tool-call response.done just fired — closing summary is now playing.
+          // Advance to stage 2 so the NEXT response.done triggers the hangup.
+          hangupArmed  = false;
+          hangupReady  = true;
+          console.log('Booking confirmed — closing summary started, hangup ready');
         }
 
         // If caller spoke while AI was still talking, respond now that AI is done
