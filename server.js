@@ -388,8 +388,8 @@ STEP 9 — NOW call book_appointment with:
 
 STEP 10 — After booking is confirmed, give the closing summary:
           "[Full name], you're all set! We have you booked for [reason] on [day] at [time].
-           We'll reach you at [confirmed phone number]. We'll see you then — have a great day!"
-          Then stop. Do not say anything else.
+           We'll reach you at [confirmed phone number]. We'll see you then — thank you, and have a great day!"
+          Then call the end_call tool. Do not say anything else.
 
 ════════════════════════════════════════════
 CRITICAL RULES — never break these:
@@ -636,7 +636,7 @@ wss.on('connection', (twilioWs) => {
               type: 'conversation.item.create',
               item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) },
             });
-            setTimeout(() => doHangup(), 3000);
+            setTimeout(() => doHangup(), 1500);
             return; // skip the rest of the tool handling below
 
           } else if (fnName === 'check_availability') {
@@ -741,7 +741,7 @@ wss.on('connection', (twilioWs) => {
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              'The appointment is confirmed. Say the closing summary out loud: use their full name, confirm the reason, date, time, and the phone number we have on file. End with "We\'ll see you then — have a great day!" Then immediately call the end_call tool to end the call. Do not say anything else after the summary.'
+              'The appointment is confirmed. Say the closing summary out loud: use their full name, confirm the reason, date, time, and the phone number we have on file. End with "We\'ll see you then — thank you, and have a great day!" Then immediately call the end_call tool. Do not say anything else.'
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
