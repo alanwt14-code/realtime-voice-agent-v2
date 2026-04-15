@@ -129,7 +129,16 @@ async function getAvailableSlots(category, patientType, reason, timePreference =
     searchStart = new Date(now);
     searchStart.setDate(searchStart.getDate() + daysOffset);
     searchStart.setHours(0, 0, 0, 0); // start of that day
-    // If the requested start is already past the normal search window, extend it
+
+    // Snap back to Monday of the target week so we never skip Mon/Tue/etc.
+    // getDay(): 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+    const dow = searchStart.getDay();
+    const daysToMonday = dow === 0 ? -6 : 1 - dow; // negative = go back, 0 = already Mon
+    if (daysToMonday < 0) {
+      searchStart.setDate(searchStart.getDate() + daysToMonday);
+    }
+
+    // Extend search window so it covers at least a full week from searchStart
     const minEnd = new Date(searchStart.getTime() + 7 * 24 * 60 * 60 * 1000);
     searchHours  = Math.max(searchHours, (minEnd - now) / (60 * 60 * 1000));
   }
