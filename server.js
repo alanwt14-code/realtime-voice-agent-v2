@@ -423,8 +423,7 @@ wss.on('connection', (twilioWs) => {
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
-  let lastAudioMs             = 0;     // timestamp of last audio chunk received from OpenAI
-  let hangupPoller            = null;  // interval that watches for 3s of silence after booking
+  let bookingResponsesDone    = 0;     // counts response.done events after booking (1=tool call, 2=summary)
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
 
@@ -600,7 +599,6 @@ wss.on('connection', (twilioWs) => {
       // Stream audio back to Twilio
       if (data.type === 'response.audio.delta' && data.delta && streamSid) {
         safeSendToTwilio({ event: 'media', streamSid, media: { payload: data.delta } });
-        if (callBooked) lastAudioMs = Date.now(); // track last audio chunk for hangup timing
       }
 
       // Track function call name + ID when a tool call starts
@@ -672,21 +670,10 @@ wss.on('connection', (twilioWs) => {
               datetime:        datetimeToBook,
               durationMinutes: durationToBook,
             });
-            offeredSlots = [];
-            callBooked   = true;
-            lastAudioMs  = Date.now();
+            offeredSlots         = [];
+            callBooked           = true;
+            bookingResponsesDone = 0;
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
-
-            // Hang up 3 seconds after the last audio chunk stops streaming.
-            // Poll every 500ms — fires once the closing summary fully plays out.
-            hangupPoller = setInterval(() => {
-              if (callClosed) { clearInterval(hangupPoller); return; }
-              if (Date.now() - lastAudioMs >= 3000) {
-                clearInterval(hangupPoller);
-                console.log('3s audio silence after summary — hanging up');
-                doHangup();
-              }
-            }, 500);
           }
         } catch (err) {
           console.error(`Tool ${fnName} failed:`, err.message);
@@ -749,7 +736,18 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
-        // Hangup is handled by the audio-silence poller started at booking time — nothing needed here.
+        // Hangup logic: count response.done events after booking.
+        // response.done #1 = the tool-call response ending (booking confirmed, summary about to start)
+        // response.done #2 = the closing summary fully done → hang up after 3 seconds
+        if (callBooked) {
+          bookingResponsesDone++;
+          console.log(`response.done after booking — count: ${bookingResponsesDone}`);
+          if (bookingResponsesDone >= 2) {
+            console.log('Closing summary done — hanging up in 3 seconds');
+            setTimeout(() => doHangup(), 3000);
+            return;
+          }
+        }
 
         // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
@@ -774,7 +772,7 @@ wss.on('connection', (twilioWs) => {
         // Once booked, only allow responses for the phone confirmation — block tool-triggering responses after that
         // (tool re-booking is blocked separately in the tool execution block)
 
-        if (callerHasStartedSpeaking) {
+        if (callerHasStartedSpeaking && !callBooked) {
           if (!assistantSpeaking) {
             // Build the instruction based on where we are in the call
             let instruction;
