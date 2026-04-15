@@ -471,7 +471,7 @@ wss.on('connection', (twilioWs) => {
       session: {
         modalities: ['audio', 'text'],
         instructions: buildSessionInstructions(null), // updated with caller number after Twilio start event
-        voice: 'alloy',
+        voice: 'sage',
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         turn_detection: {
