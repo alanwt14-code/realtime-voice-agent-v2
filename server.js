@@ -423,8 +423,8 @@ wss.on('connection', (twilioWs) => {
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
-  let hangupArmed             = false; // true after booking succeeds — waiting for closing summary
-  let hangupReady             = false; // true after closing summary starts — next response.done hangs up
+  let lastAudioMs             = 0;     // timestamp of last audio chunk received from OpenAI
+  let hangupPoller            = null;  // interval that watches for 3s of silence after booking
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
 
@@ -524,7 +524,7 @@ wss.on('connection', (twilioWs) => {
           type: 'server_vad',
           threshold: 0.8,
           prefix_padding_ms: 300,
-          silence_duration_ms: 900,
+          silence_duration_ms: 700,
           create_response: false,
           interrupt_response: true,
         },
@@ -600,6 +600,7 @@ wss.on('connection', (twilioWs) => {
       // Stream audio back to Twilio
       if (data.type === 'response.audio.delta' && data.delta && streamSid) {
         safeSendToTwilio({ event: 'media', streamSid, media: { payload: data.delta } });
+        if (callBooked) lastAudioMs = Date.now(); // track last audio chunk for hangup timing
       }
 
       // Track function call name + ID when a tool call starts
@@ -673,16 +674,19 @@ wss.on('connection', (twilioWs) => {
             });
             offeredSlots = [];
             callBooked   = true;
-            hangupArmed  = true; // arm the hangup — fires after closing summary plays
+            lastAudioMs  = Date.now();
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
 
-            // Safety-net: if response.done never fires for some reason, hang up after 20 seconds
-            setTimeout(() => {
-              if (!callClosed) {
-                console.log('Safety-net hangup triggered');
+            // Hang up 3 seconds after the last audio chunk stops streaming.
+            // Poll every 500ms — fires once the closing summary fully plays out.
+            hangupPoller = setInterval(() => {
+              if (callClosed) { clearInterval(hangupPoller); return; }
+              if (Date.now() - lastAudioMs >= 3000) {
+                clearInterval(hangupPoller);
+                console.log('3s audio silence after summary — hanging up');
                 doHangup();
               }
-            }, 5000);
+            }, 500);
           }
         } catch (err) {
           console.error(`Tool ${fnName} failed:`, err.message);
@@ -745,41 +749,16 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
-        // Two-stage hangup:
-        // Stage 1 (hangupArmed)  — booking just confirmed, closing summary just scheduled.
-        //   The response.done firing here belongs to the tool-call response. Advance to stage 2.
-        // Stage 2 (hangupReady)  — closing summary just finished. Hang up now.
-        if (hangupReady) {
-          hangupReady = false;
-          console.log('Closing summary done — hanging up now');
-          doHangup();
-          return;
-        }
-
-        if (hangupArmed) {
-          hangupArmed = false;
-          hangupReady = true;
-          console.log('Tool-call response done — closing summary playing, hangup ready');
-        }
+        // Hangup is handled by the audio-silence poller started at booking time — nothing needed here.
 
         // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
           pendingCallerResponse = false;
-          let instruction;
-
-          if (callPhase === 'slots_offered') {
-            callPhase = 'confirming_phone';
-            const phoneDisplay = callerPhoneNumber || 'the number you called from';
-            instruction = `The caller just picked a time slot. Do NOT call book_appointment yet. Ask ONLY this one question: "I have ${phoneDisplay} as the best number to reach you — is that correct?" Then STOP. Do not book yet.`;
-          } else if (callPhase === 'confirming_phone') {
-            callPhase = 'done';
-            const phoneDisplay = callerPhoneNumber || 'unknown';
-            instruction = `The caller just responded to the phone confirmation. If they said yes, call book_appointment using phone="${phoneDisplay}". If they said no or gave a different number, use that number. Call book_appointment now.`;
-          } else {
-            instruction = 'The caller just spoke. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow: issue → full name → new/existing → morning/afternoon → call check_availability. Never ask for a phone number. One question at a time.';
-          }
-
-          createAssistantResponse(instruction);
+          // Caller interrupted while AI was speaking — do NOT advance the phase.
+          // Just let the AI respond naturally to what the caller said and continue from where it was.
+          createAssistantResponse(
+            'The caller spoke while you were talking. Listen to what they said and respond naturally. Continue with whatever you were in the middle of asking them — do not skip ahead. One question at a time.'
+          );
         }
       }
 
