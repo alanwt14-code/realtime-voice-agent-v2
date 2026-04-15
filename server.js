@@ -423,6 +423,7 @@ wss.on('connection', (twilioWs) => {
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
+  let pendingHangup           = false;
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
 
@@ -629,15 +630,14 @@ wss.on('connection', (twilioWs) => {
         let result;
         try {
           if (fnName === 'end_call') {
-            // AI finished the closing summary — hang up after 3 seconds
-            console.log('end_call tool received — hanging up in 3 seconds');
+            console.log('end_call received — will hang up after final audio finishes');
+            pendingHangup = true;
             result = { success: true };
             safeSendToOpenAI({
               type: 'conversation.item.create',
               item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) },
             });
-            setTimeout(() => doHangup(), 1500);
-            return; // skip the rest of the tool handling below
+            return; // do not hang up yet — wait for response.done
 
           } else if (fnName === 'check_availability') {
             const availability = await getAvailableSlots(args.category, args.patient_type, args.reason, args.time_preference || 'any', args.days_offset || 0);
@@ -760,7 +760,12 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
-        // Hangup is triggered by the end_call tool — nothing needed here.
+        if (pendingHangup) {
+          pendingHangup = false;
+          console.log('Final audio finished — hanging up');
+          setTimeout(() => doHangup(), 750);
+          return;
+        }
 
         // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
