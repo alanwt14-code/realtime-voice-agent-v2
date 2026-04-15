@@ -423,7 +423,6 @@ wss.on('connection', (twilioWs) => {
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
-  let bookingResponsesDone    = 0;     // counts response.done events after booking (1=tool call, 2=summary)
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
 
@@ -579,6 +578,12 @@ wss.on('connection', (twilioWs) => {
               required: ['name', 'phone', 'reason', 'category', 'patient_type', 'datetime', 'duration_minutes'],
             },
           },
+          {
+            type: 'function',
+            name: 'end_call',
+            description: 'End the call. Call this immediately after finishing the closing summary — after saying "have a great day". No parameters needed.',
+            parameters: { type: 'object', properties: {}, required: [] },
+          },
         ],
         tool_choice: 'auto',
       },
@@ -623,7 +628,18 @@ wss.on('connection', (twilioWs) => {
 
         let result;
         try {
-          if (fnName === 'check_availability') {
+          if (fnName === 'end_call') {
+            // AI finished the closing summary — hang up after 3 seconds
+            console.log('end_call tool received — hanging up in 3 seconds');
+            result = { success: true };
+            safeSendToOpenAI({
+              type: 'conversation.item.create',
+              item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) },
+            });
+            setTimeout(() => doHangup(), 3000);
+            return; // skip the rest of the tool handling below
+
+          } else if (fnName === 'check_availability') {
             const availability = await getAvailableSlots(args.category, args.patient_type, args.reason, args.time_preference || 'any', args.days_offset || 0);
 
             // Store offered slots server-side so we can validate the booking later
@@ -664,9 +680,8 @@ wss.on('connection', (twilioWs) => {
             // Set callBooked=true BEFORE the async Google Calendar call so that
             // response.done for the tool-call response (which arrives during the await)
             // gets counted correctly. Reset to false in catch if booking fails.
-            offeredSlots         = [];
-            callBooked           = true;
-            bookingResponsesDone = 0;
+            offeredSlots = [];
+            callBooked   = true;
 
             const event = await createAppointment({
               name:            args.name,
@@ -684,8 +699,7 @@ wss.on('connection', (twilioWs) => {
 
           // Reset booking flags if the appointment creation failed
           if (fnName === 'book_appointment') {
-            callBooked           = false;
-            bookingResponsesDone = 0;
+            callBooked = false;
           }
 
           // Handle slot-taken race condition gracefully
@@ -727,7 +741,7 @@ wss.on('connection', (twilioWs) => {
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              'The appointment is confirmed. Give a warm closing: use their full name, confirm the reason and appointment date and time. Say "We\'ll see you then — have a great day!" Do not ask about the phone number again — it was already confirmed before booking. Do not call any more tools. The call is done.'
+              'The appointment is confirmed. Say the closing summary out loud: use their full name, confirm the reason, date, time, and the phone number we have on file. End with "We\'ll see you then — have a great day!" Then immediately call the end_call tool to end the call. Do not say anything else after the summary.'
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
@@ -746,18 +760,7 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
-        // Hangup logic: count response.done events after booking.
-        // response.done #1 = the tool-call response ending (booking confirmed, summary about to start)
-        // response.done #2 = the closing summary fully done → hang up after 3 seconds
-        if (callBooked) {
-          bookingResponsesDone++;
-          console.log(`response.done after booking — count: ${bookingResponsesDone}`);
-          if (bookingResponsesDone >= 2) {
-            console.log('Closing summary done — hanging up in 3 seconds');
-            setTimeout(() => doHangup(), 3000);
-            return;
-          }
-        }
+        // Hangup is triggered by the end_call tool — nothing needed here.
 
         // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
