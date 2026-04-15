@@ -661,6 +661,13 @@ wss.on('connection', (twilioWs) => {
               ? args.phone
               : (callerPhoneNumber || 'unknown');
 
+            // Set callBooked=true BEFORE the async Google Calendar call so that
+            // response.done for the tool-call response (which arrives during the await)
+            // gets counted correctly. Reset to false in catch if booking fails.
+            offeredSlots         = [];
+            callBooked           = true;
+            bookingResponsesDone = 0;
+
             const event = await createAppointment({
               name:            args.name,
               phone:           phoneToUse,
@@ -670,13 +677,16 @@ wss.on('connection', (twilioWs) => {
               datetime:        datetimeToBook,
               durationMinutes: durationToBook,
             });
-            offeredSlots         = [];
-            callBooked           = true;
-            bookingResponsesDone = 0;
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
           }
         } catch (err) {
           console.error(`Tool ${fnName} failed:`, err.message);
+
+          // Reset booking flags if the appointment creation failed
+          if (fnName === 'book_appointment') {
+            callBooked           = false;
+            bookingResponsesDone = 0;
+          }
 
           // Handle slot-taken race condition gracefully
           if (err.message === 'SLOT_TAKEN') {
