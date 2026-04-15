@@ -26,6 +26,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
 
+// Twilio REST client — used to hang up the call after the closing summary
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
@@ -410,11 +413,13 @@ wss.on('connection', (twilioWs) => {
   console.log('Twilio connected');
 
   let streamSid               = null;
+  let callSid                 = null; // Twilio CallSid — needed to hang up via REST API
   let callerPhoneNumber       = null; // populated from Twilio caller ID
   let openaiReady             = false;
   let greetingSent            = false;
   let callClosed              = false;
   let callBooked              = false;
+  let hangupAfterResponse     = false; // set after booking confirmed — hang up on next response.done
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
   let pendingCallerResponse   = false;
@@ -635,8 +640,9 @@ wss.on('connection', (twilioWs) => {
               datetime:        datetimeToBook,
               durationMinutes: durationToBook,
             });
-            offeredSlots = [];
-            callBooked   = true;
+            offeredSlots        = [];
+            callBooked          = true;
+            hangupAfterResponse = true; // hang up once the closing summary is spoken
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
           }
         } catch (err) {
@@ -700,6 +706,21 @@ wss.on('connection', (twilioWs) => {
         callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
         console.log('Assistant finished speaking');
 
+        // Hang up automatically after the closing summary is spoken
+        if (hangupAfterResponse && callSid) {
+          hangupAfterResponse = false;
+          console.log('Hanging up call:', callSid);
+          setTimeout(async () => {
+            try {
+              await twilioClient.calls(callSid).update({ status: 'completed' });
+              console.log('Call ended successfully');
+            } catch (err) {
+              console.error('Failed to hang up call:', err.message);
+            }
+          }, 1000); // 1-second pause so the last word isn't clipped
+          return;
+        }
+
         // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
           pendingCallerResponse = false;
@@ -753,8 +774,10 @@ wss.on('connection', (twilioWs) => {
 
       if (data.event === 'start') {
         streamSid         = data.start.streamSid;
+        callSid           = data.start.callSid || null;
         callerPhoneNumber = data.start.customParameters?.callerNumber || null;
         console.log('Caller number:', callerPhoneNumber || 'unknown');
+        console.log('Call SID:', callSid || 'unknown');
 
         // Now that we have the caller's number, update the session instructions
         // so the AI knows to skip asking for it and confirm it at the end instead
