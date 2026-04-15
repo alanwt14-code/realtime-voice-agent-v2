@@ -314,6 +314,10 @@ app.post('/voice', (req, res) => {
     stream.parameter({ name: 'callerNumber', value: req.body.From });
   }
 
+  // When the stream WebSocket closes, Twilio executes <Hangup> and ends the call.
+  // This ensures closing the WebSocket from our side is enough to hang up.
+  twiml.hangup();
+
   res.type('text/xml');
   res.send(twiml.toString());
 });
@@ -450,6 +454,25 @@ wss.on('connection', (twilioWs) => {
       },
     }
   );
+
+  function doHangup() {
+    if (callClosed) return;
+    console.log('doHangup called — callSid:', callSid);
+    // Try REST API first (cleanest), always close WebSocket too as guaranteed fallback.
+    // The TwiML <Hangup> after the stream ensures WebSocket close = call end.
+    if (callSid) {
+      twilioClient.calls(callSid).update({ status: 'completed' })
+        .then(() => console.log('Call ended via REST API'))
+        .catch(err => console.error('REST hangup failed:', err.message));
+    }
+    // Always close WebSocket regardless — belt and suspenders
+    setTimeout(() => {
+      if (!callClosed) {
+        console.log('Closing WebSocket to end call');
+        twilioWs.close();
+      }
+    }, 1500);
+  }
 
   function safeSendToOpenAI(payload) {
     if (!callClosed && openaiWs.readyState === WebSocket.OPEN) {
@@ -650,8 +673,16 @@ wss.on('connection', (twilioWs) => {
             });
             offeredSlots = [];
             callBooked   = true;
-            hangupArmed  = true; // arm the hangup — will fire after closing summary plays
+            hangupArmed  = true; // arm the hangup — fires after closing summary plays
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
+
+            // Safety-net: if response.done never fires for some reason, hang up after 20 seconds
+            setTimeout(() => {
+              if (!callClosed) {
+                console.log('Safety-net hangup triggered');
+                doHangup();
+              }
+            }, 5000);
           }
         } catch (err) {
           console.error(`Tool ${fnName} failed:`, err.message);
@@ -715,36 +746,20 @@ wss.on('connection', (twilioWs) => {
         console.log('Assistant finished speaking');
 
         // Two-stage hangup:
-        // Stage 1 — hangupArmed: booking just succeeded, closing summary was just triggered.
-        //           This response.done is from the tool-call response. Advance to stage 2.
-        // Stage 2 — hangupReady: closing summary just finished playing. Hang up now.
+        // Stage 1 (hangupArmed)  — booking just confirmed, closing summary just scheduled.
+        //   The response.done firing here belongs to the tool-call response. Advance to stage 2.
+        // Stage 2 (hangupReady)  — closing summary just finished. Hang up now.
         if (hangupReady) {
           hangupReady = false;
-          console.log('Closing summary done — hanging up');
-          if (callSid) {
-            setTimeout(async () => {
-              try {
-                await twilioClient.calls(callSid).update({ status: 'completed' });
-                console.log('Call ended successfully');
-              } catch (err) {
-                console.error('Failed to hang up via REST:', err.message);
-                // Fallback: close the WebSocket so Twilio drops the call
-                twilioWs.close();
-              }
-            }, 1000);
-          } else {
-            // No callSid — close WebSocket as fallback
-            setTimeout(() => twilioWs.close(), 1000);
-          }
+          console.log('Closing summary done — hanging up now');
+          doHangup();
           return;
         }
 
         if (hangupArmed) {
-          // Tool-call response.done just fired — closing summary is now playing.
-          // Advance to stage 2 so the NEXT response.done triggers the hangup.
-          hangupArmed  = false;
-          hangupReady  = true;
-          console.log('Booking confirmed — closing summary started, hangup ready');
+          hangupArmed = false;
+          hangupReady = true;
+          console.log('Tool-call response done — closing summary playing, hangup ready');
         }
 
         // If caller spoke while AI was still talking, respond now that AI is done
