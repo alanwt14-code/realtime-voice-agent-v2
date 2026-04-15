@@ -304,17 +304,18 @@ REQUIRED FLOW (follow in exact order, never skip or reorder):
 3. If EMERGENCY: ask exactly ONE follow-up question — pick the most relevant:
    "Are you in any pain right now?" / "Is there any swelling?" / "How long has this been going on?"
    Only one. Then move on.
-4. Ask for their full name.
+4. Ask for their full name. Always ask for FULL name (first and last).
 5. Ask if they are a new or existing patient.
 6. Ask: "Do you prefer mornings or afternoons?" Wait for their answer.
 7. Call check_availability with the correct category, patient_type, reason, and time_preference.
 8. Offer exactly 2 time slots. Stop and wait for the caller to pick one.
-9. Call book_appointment using phone="${callerPhone || 'TO_BE_CONFIRMED'}", name, reason, category, patient_type, datetime, duration_minutes.
-10. After booking confirms, say the appointment summary: name, new/existing, reason, and time.
-    Then ask: "Is the number you're calling from the best way to reach you?"
-    - If yes: say "Perfect — we'll see you then, have a great day!" and end the call.
-    - If no: ask "What's the best number to reach you?" Wait for their answer, say "Got it — we'll see you then, have a great day!" and end the call.
-11. Call is complete. Do not say anything further.
+9. Once they pick a time, confirm the phone number BEFORE booking:
+   Say: "I have ${callerPhone ? callerPhone : 'your number on file'} as your contact — is that the best way to reach you?"
+   - If yes: use ${callerPhone || 'that number'} as the phone when calling book_appointment.
+   - If no: ask "What's the best number?" wait for their answer, use that number when calling book_appointment.
+10. Call book_appointment with the confirmed phone number, full name, reason, category, patient_type, datetime, duration_minutes.
+11. After booking confirms, say: "[Full name], you're all set — we have you down for [reason] on [date and time]. We'll see you then, have a great day!"
+12. Call is complete. Do not say anything further.
 
 URGENCY TONE:
 - emergency:  empathy and urgency, move fast
@@ -323,8 +324,9 @@ URGENCY TONE:
 
 RULES:
 - One question at a time. Wait for the answer before continuing.
-- NEVER ask for a phone number at any point during the call. It is handled automatically.
-- Never book before you have: issue + name + new/existing + chosen time.
+- NEVER ask for a phone number mid-call. Confirm it at step 9 only.
+- Always ask for FULL name — first and last.
+- Never call book_appointment before the phone number is confirmed at step 9.
 - Do not diagnose medical conditions.
   `;
 }
@@ -542,8 +544,12 @@ wss.on('connection', (twilioWs) => {
             const datetimeToBook     = closestSlot ? closestSlot.slot.iso : args.datetime;
             const durationToBook     = closestSlot ? closestSlot.slot.durationMinutes : args.duration_minutes;
 
-            // Always use the real caller ID if we have it — ignore whatever the AI sends
-            const phoneToUse = callerPhoneNumber || args.phone || 'unknown';
+            // Use the phone number the AI confirmed with the caller.
+            // If the caller gave a different number, the AI will send that.
+            // Fall back to callerPhoneNumber if AI sends nothing useful.
+            const phoneToUse = (args.phone && args.phone !== 'TO_BE_CONFIRMED' && args.phone !== 'unknown')
+              ? args.phone
+              : (callerPhoneNumber || 'unknown');
 
             const event = await createAppointment({
               name:            args.name,
@@ -599,7 +605,7 @@ wss.on('connection', (twilioWs) => {
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              `The appointment is confirmed. Read back the summary: their name, new or existing patient, reason for visit, and appointment date and time. Then say: "I also have ${phoneToUse} as your contact number — is that the best way to reach you?" If yes, say "Perfect — we'll see you then, have a great day!" and end the call. If no, ask "What's the best number?" wait for their answer, then say "Got it — we'll see you then, have a great day!" and end the call. Do not call any more tools.`
+              'The appointment is confirmed. Give a warm closing: use their full name, confirm the reason and appointment date and time. Say "We\'ll see you then — have a great day!" Do not ask about the phone number again — it was already confirmed before booking. Do not call any more tools. The call is done.'
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
@@ -642,7 +648,7 @@ wss.on('connection', (twilioWs) => {
           if (!assistantSpeaking) {
             // Normal turn: AI is silent, respond now
             createAssistantResponse(
-              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow: understand issue → name → new/existing → morning or afternoon preference → check_availability → offer 2 times → book_appointment → confirm summary then ask if their calling number is the best to reach them. Never ask for a phone number. One question at a time.'
+              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow: understand issue → full name (first and last) → new/existing → morning or afternoon preference → check_availability → offer 2 times → confirm phone number → book_appointment → closing summary. Never ask for a phone number mid-call. One question at a time.'
             );
           } else {
             // Interruption: AI is still finishing — flag it and respond once done
