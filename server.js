@@ -422,9 +422,11 @@ wss.on('connection', (twilioWs) => {
   let openaiReady             = false;
   let greetingSent            = false;
   let callClosed              = false;
-  let callBooked              = false;
-  let pendingHangup           = false;
-  let assistantSpeaking       = false;
+  let callBooked                   = false;
+  let pendingHangup                = false;
+  let waitingForTwilioPlaybackMark = false;
+  const FINAL_PLAYBACK_MARK        = 'final-summary-played';
+  let assistantSpeaking            = false;
   let callerHasStartedSpeaking = false;
 
   // Phase tracker — controls exactly what the AI is told to do each turn
@@ -471,6 +473,12 @@ wss.on('connection', (twilioWs) => {
         twilioWs.close();
       }
     }, 1500);
+  }
+
+  function sendTwilioMark(name) {
+    if (!callClosed && twilioWs.readyState === WebSocket.OPEN && streamSid) {
+      twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
+    }
   }
 
   function safeSendToOpenAI(payload) {
@@ -762,8 +770,9 @@ wss.on('connection', (twilioWs) => {
 
         if (pendingHangup) {
           pendingHangup = false;
-          console.log('Final audio finished — hanging up');
-          setTimeout(() => doHangup(), 750);
+          waitingForTwilioPlaybackMark = true;
+          console.log('OpenAI done — sending Twilio mark, waiting for playback to finish');
+          sendTwilioMark(FINAL_PLAYBACK_MARK);
           return;
         }
 
@@ -860,6 +869,16 @@ wss.on('connection', (twilioWs) => {
 
       if (data.event === 'media') {
         safeSendToOpenAI({ type: 'input_audio_buffer.append', audio: data.media.payload });
+      }
+
+      if (data.event === 'mark') {
+        const markName = data.mark?.name;
+        console.log('Twilio mark received:', markName);
+        if (waitingForTwilioPlaybackMark && markName === FINAL_PLAYBACK_MARK) {
+          waitingForTwilioPlaybackMark = false;
+          console.log('Twilio finished playing final audio — hanging up');
+          setTimeout(() => doHangup(), 300);
+        }
       }
 
       if (data.event === 'stop') {
