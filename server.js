@@ -422,6 +422,13 @@ wss.on('connection', (twilioWs) => {
   let hangupAfterResponse     = false; // set after booking confirmed — hang up on next response.done
   let assistantSpeaking       = false;
   let callerHasStartedSpeaking = false;
+
+  // Phase tracker — controls exactly what the AI is told to do each turn
+  // 'collecting'       → gathering name, patient type, time preference
+  // 'slots_offered'    → 2 slots read aloud, waiting for caller to pick one
+  // 'confirming_phone' → phone confirmation question asked, waiting for yes/no
+  // 'done'             → booking complete
+  let callPhase = 'collecting';
   let pendingCallerResponse   = false;
 
   // Slot validation: store the slots we offered so we can verify the AI only books one of them
@@ -675,9 +682,9 @@ wss.on('connection', (twilioWs) => {
         // Give the AI explicit instructions for what to do next based on the tool result
         if (fnName === 'check_availability') {
           if (result.success) {
-            const phoneDisplay = callerPhoneNumber || 'the number you called from';
+            callPhase = 'slots_offered';
             createAssistantResponse(
-              `The calendar has been checked. Read the formatted_slots to the caller — offer exactly the 2 options. Say something like "I have [slot 1] or [slot 2] — which works better for you?" Then STOP and wait for their answer.\n\nONCE they pick a time, do NOT call book_appointment yet. First confirm the phone number by saying: "I have ${phoneDisplay} as the best number to reach you — is that correct?" Then STOP and wait for yes or no.\n• If yes → call book_appointment using phone="${phoneDisplay}".\n• If no  → ask "What number would you like us to use?" Wait for their answer, then call book_appointment using that number.\n\nNever call book_appointment before the phone is confirmed. Use the exact ISO datetime string from the slots array.`
+              'The calendar has been checked. Read ONLY the 2 time options from formatted_slots to the caller. Say something like "I have [slot 1] or [slot 2] — which works better for you?" Then STOP. Do not mention the phone number. Do not call book_appointment. Just offer the 2 slots and wait for the caller to choose.'
             );
           } else {
             createAssistantResponse(
@@ -724,9 +731,21 @@ wss.on('connection', (twilioWs) => {
         // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
           pendingCallerResponse = false;
-          createAssistantResponse(
-            'The caller just spoke. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow: issue → full name → new/existing → morning/afternoon → check_availability → offer 2 times → pick a time → THEN confirm phone → book_appointment → summary. Never ask for phone number before they have picked a time. One question at a time.'
-          );
+          let instruction;
+
+          if (callPhase === 'slots_offered') {
+            callPhase = 'confirming_phone';
+            const phoneDisplay = callerPhoneNumber || 'the number you called from';
+            instruction = `The caller just picked a time slot. Do NOT call book_appointment yet. Ask ONLY this one question: "I have ${phoneDisplay} as the best number to reach you — is that correct?" Then STOP. Do not book yet.`;
+          } else if (callPhase === 'confirming_phone') {
+            callPhase = 'done';
+            const phoneDisplay = callerPhoneNumber || 'unknown';
+            instruction = `The caller just responded to the phone confirmation. If they said yes, call book_appointment using phone="${phoneDisplay}". If they said no or gave a different number, use that number. Call book_appointment now.`;
+          } else {
+            instruction = 'The caller just spoke. Respond in English as the dental receptionist. Continue naturally from what the caller said. Follow the session flow: issue → full name → new/existing → morning/afternoon → call check_availability. Never ask for a phone number. One question at a time.';
+          }
+
+          createAssistantResponse(instruction);
         }
       }
 
@@ -744,10 +763,27 @@ wss.on('connection', (twilioWs) => {
 
         if (callerHasStartedSpeaking) {
           if (!assistantSpeaking) {
-            // Normal turn: AI is silent, respond now
-            createAssistantResponse(
-              'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow in order: understand issue → full name (first and last) → new/existing → morning or afternoon preference → call check_availability → offer 2 time slots → wait for them to pick one → THEN confirm phone number → call book_appointment → closing summary with phone number included. NEVER ask for a phone number before they have picked a time slot. One question at a time.'
-            );
+            // Build the instruction based on where we are in the call
+            let instruction;
+
+            if (callPhase === 'slots_offered') {
+              // Caller just picked a time — now ask phone confirmation ONLY, do not book
+              callPhase = 'confirming_phone';
+              const phoneDisplay = callerPhoneNumber || 'the number you called from';
+              instruction = `The caller just picked a time slot. Do NOT call book_appointment yet. Ask ONLY this one question: "I have ${phoneDisplay} as the best number to reach you — is that correct?" Then STOP and wait for their answer. Do not book. Do not say anything else.`;
+
+            } else if (callPhase === 'confirming_phone') {
+              // Caller just answered yes/no to the phone confirmation — now book
+              callPhase = 'done';
+              const phoneDisplay = callerPhoneNumber || 'unknown';
+              instruction = `The caller just responded to the phone confirmation. If they said yes, call book_appointment using phone="${phoneDisplay}". If they said no or gave a different number, use that new number instead. Call book_appointment now with the correct phone, full name, reason, category, patient_type, datetime (exact ISO string from the slots array), and duration_minutes.`;
+
+            } else {
+              // Normal info-gathering phase
+              instruction = 'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow: understand issue → full name (first and last) → new/existing → morning or afternoon preference → call check_availability. NEVER ask for a phone number. One question at a time.';
+            }
+
+            createAssistantResponse(instruction);
           } else {
             // Interruption: AI is still finishing — flag it and respond once done
             pendingCallerResponse = true;
