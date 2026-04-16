@@ -327,6 +327,72 @@ async function getAvailableSlots(category, patientType, reason, timePreference =
     }
   }
 
+  // If we found fewer than 2 slots, silently extend the search window by
+  // 2 weeks and try again — never tell the caller there's nothing available.
+  if (slots.length < maxOptions) {
+    // Scan forward in 30-day chunks for up to 1 year until we have 2 slots.
+    // Google's freebusy API has a max window of ~60 days per call so we
+    // chunk the search to stay within limits.
+    console.log(`Only ${slots.length} slot(s) found in original window — scanning up to 1 year forward`);
+
+    const ONE_YEAR_MS   = 365 * 24 * 60 * 60 * 1000;
+    const CHUNK_DAYS    = 30;
+    const hardLimit     = new Date(now.getTime() + ONE_YEAR_MS);
+
+    let chunkStart = new Date(searchEnd);
+
+    while (slots.length < maxOptions && chunkStart < hardLimit) {
+      const chunkEnd = new Date(
+        Math.min(chunkStart.getTime() + CHUNK_DAYS * 24 * 60 * 60 * 1000, hardLimit.getTime())
+      );
+
+      const chunkRes = await calendarClient.freebusy.query({
+        requestBody: {
+          timeMin: chunkStart.toISOString(),
+          timeMax: chunkEnd.toISOString(),
+          items: [{ id: CALENDAR_ID }],
+        },
+      });
+
+      const chunkBusy = (chunkRes.data.calendars[CALENDAR_ID]?.busy || []).map(b => ({
+        start: new Date(b.start), end: new Date(b.end),
+      }));
+
+      const extCurrent = new Date(chunkStart);
+      const extHours   = BUSINESS_HOURS[extCurrent.getDay()];
+      if (!extHours) advanceToNextBusinessOpen(extCurrent);
+      else extCurrent.setHours(extHours.open, 0, 0, 0);
+
+      let extSafety = 0;
+      while (slots.length < maxOptions && extCurrent < chunkEnd && extSafety++ < 1000) {
+        const dayHours = BUSINESS_HOURS[extCurrent.getDay()];
+        if (!dayHours) { advanceToNextBusinessOpen(extCurrent); continue; }
+        if (extCurrent.getHours() < dayHours.open) { extCurrent.setHours(dayHours.open, 0, 0, 0); continue; }
+
+        const currentHour = extCurrent.getHours();
+        if (timePreference === 'morning'   && currentHour >= 12) { advanceToNextBusinessOpen(extCurrent); continue; }
+        if (timePreference === 'afternoon' && currentHour <  12) { extCurrent.setHours(12, 0, 0, 0); continue; }
+
+        const slotEnd        = new Date(extCurrent.getTime() + durationMinutes * 60 * 1000);
+        const slotEndMinutes = slotEnd.getHours() * 60 + slotEnd.getMinutes();
+        if (slotEndMinutes > dayHours.close * 60) { advanceToNextBusinessOpen(extCurrent); continue; }
+
+        const conflict = chunkBusy.find(b => extCurrent < b.end && slotEnd > b.start);
+        if (!conflict) {
+          slots.push(new Date(extCurrent));
+          advanceToNextBusinessOpen(extCurrent);
+        } else {
+          extCurrent.setTime(conflict.end.getTime());
+          snapToNext30(extCurrent);
+        }
+      }
+
+      chunkStart = new Date(chunkEnd); // advance to next chunk
+    }
+
+    console.log(`After extended search: ${slots.length} slot(s) found (searched up to 1 year out)`);
+  }
+
   return { slots, durationMinutes, formatted: slots.map(formatSlotForSpeech) };
 }
 
