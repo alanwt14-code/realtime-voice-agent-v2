@@ -568,9 +568,9 @@ wss.on('connection', (twilioWs) => {
         output_audio_format: 'g711_ulaw',
         turn_detection: {
           type: 'server_vad',
-          threshold: 0.8,
+          threshold: 0.85,
           prefix_padding_ms: 300,
-          silence_duration_ms: 700,
+          silence_duration_ms: 1200,
           create_response: false,
           interrupt_response: true,
         },
@@ -764,8 +764,7 @@ wss.on('connection', (twilioWs) => {
       }
 
       if (data.type === 'response.done') {
-        assistantSpeaking        = false;
-        callerHasStartedSpeaking = false;
+        assistantSpeaking = false;
         console.log('Assistant finished speaking');
 
         if (pendingHangup) {
@@ -773,14 +772,24 @@ wss.on('connection', (twilioWs) => {
           waitingForTwilioPlaybackMark = true;
           console.log('OpenAI done — sending Twilio mark, waiting for playback to finish');
           sendTwilioMark(FINAL_PLAYBACK_MARK);
+          // Reset speech tracking so stale state doesn't bleed into next turn
+          callerHasStartedSpeaking = false;
           return;
         }
 
-        if (pendingCallerResponse) {
-          pendingCallerResponse = false;
+        // Only react to an interruption if the caller ACTUALLY spoke during
+        // this AI turn. Prevents response.done from auto-firing after the
+        // greeting (or any other AI turn) before the caller has said anything.
+        if (pendingCallerResponse && callerHasStartedSpeaking) {
+          pendingCallerResponse    = false;
+          callerHasStartedSpeaking = false;
           createAssistantResponse(
             'The caller spoke while you were talking. Listen to what they said and respond naturally. Continue with whatever you were in the middle of asking them — do not skip ahead. One question at a time.'
           );
+        } else {
+          // AI finished speaking, caller hasn't spoken yet — just wait.
+          pendingCallerResponse    = false;
+          callerHasStartedSpeaking = false;
         }
       }
 
