@@ -123,6 +123,54 @@ async function logToSheet({ name, phone, reason, category, patientType, datetime
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Google Sheets — log full call transcript to the Transcripts tab
+//
+// Columns:  A=Timestamp  B=Caller Phone  C=Patient Name
+//           D=Category   E=Transcript
+// ─────────────────────────────────────────────────────────────────────────────
+async function logTranscriptToSheet({ name, phone, category, transcriptLines = [] }) {
+  if (!SHEET_ID) {
+    console.warn('GOOGLE_SHEET_ID not set — skipping transcript log');
+    return;
+  }
+
+  const tz = process.env.TZ || 'America/New_York';
+  const timestamp = new Date().toLocaleString('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+
+  // Format as "AI: Hello...
+Caller: Hi I need..."
+  const transcriptText = transcriptLines
+    .map(line => `${line.role}: ${line.text}`)
+    .join('
+');
+
+  const categoryLabels = { emergency: 'Emergency', high_value: 'High Value', routine: 'Routine' };
+
+  const row = [
+    timestamp,
+    phone,
+    name || 'Unknown',
+    categoryLabels[category] || category || 'Unknown',
+    transcriptText || '(no transcript captured)',
+  ];
+
+  try {
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId:    SHEET_ID,
+      range:            'Transcripts!A:E',
+      valueInputOption: 'USER_ENTERED',
+      requestBody:      { values: [row] },
+    });
+    console.log(`Transcript logged to Google Sheet (${transcriptLines.length} lines)`);
+  } catch (err) {
+    console.error('Transcript sheet log failed:', err.message); // non-fatal
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SMS helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -562,6 +610,7 @@ wss.on('connection', (twilioWs) => {
   let pendingCallerResponse = false;
   let offeredSlots          = [];
   let bookedAppointment     = null; // populated after successful book_appointment
+  let transcriptLines       = [];   // [{role, text}] built throughout the call
 
   let currentFunctionName    = null;
   let currentFunctionCallId  = null;
@@ -650,6 +699,7 @@ wss.on('connection', (twilioWs) => {
         temperature: 0.9,
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
+        input_audio_transcription: { model: 'whisper-1' },
         turn_detection: {
           type: 'server_vad',
           threshold: 0.85,
@@ -724,6 +774,24 @@ wss.on('connection', (twilioWs) => {
         console.log(`Tool call started: ${currentFunctionName}`);
       }
 
+      // Capture AI side of transcript
+      if (data.type === 'response.audio_transcript.done' && data.transcript) {
+        const text = data.transcript.trim();
+        if (text) {
+          transcriptLines.push({ role: 'AI', text });
+          console.log(`Transcript AI: ${text}`);
+        }
+      }
+
+      // Capture caller side of transcript
+      if (data.type === 'conversation.item.input_audio_transcription.completed' && data.transcript) {
+        const text = data.transcript.trim();
+        if (text) {
+          transcriptLines.push({ role: 'Caller', text });
+          console.log(`Transcript Caller: ${text}`);
+        }
+      }
+
       if (data.type === 'response.function_call_arguments.delta')
         functionCallArgsBuffer += data.delta;
 
@@ -754,10 +822,16 @@ wss.on('connection', (twilioWs) => {
                 sendOwnerSummaryText(bookedAppointment),
                 sendCustomerConfirmationText(bookedAppointment),
                 logToSheet(bookedAppointment),
+                logTranscriptToSheet({ ...bookedAppointment, transcriptLines }),
               ]).then(() => console.log('All post-call actions completed'))
                 .catch(err => console.error('Post-call action error:', err.message));
             } else {
-              console.warn('end_call fired but bookedAppointment is null — no SMS or sheet log sent');
+              // No booking made — still log the transcript so we have a record
+              console.warn('end_call fired but no booking — logging transcript only');
+              logTranscriptToSheet({
+                name: 'Unknown', phone: callerPhoneNumber || 'unknown',
+                category: 'unknown', transcriptLines,
+              }).catch(err => console.error('Transcript log error:', err.message));
             }
 
             return; // hang up after response.done + Twilio mark
