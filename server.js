@@ -486,6 +486,7 @@ wss.on('connection', (twilioWs) => {
   const FINAL_PLAYBACK_MARK        = 'final-summary-played';
   let assistantSpeaking            = false;
   let callerHasStartedSpeaking     = false;
+  let ignoreCallerAudioUntil       = 0;  // epoch ms — ignore VAD events until this time
 
   let callPhase             = 'collecting';
   let pendingCallerResponse = false;
@@ -537,6 +538,8 @@ wss.on('connection', (twilioWs) => {
     assistantSpeaking        = true;
     callerHasStartedSpeaking = false;
     pendingCallerResponse    = false;
+    // Reset cooldown — caller audio is invalid while AI is speaking
+    ignoreCallerAudioUntil   = Infinity;
     safeSendToOpenAI({
       type: 'response.create',
       response: {
@@ -770,7 +773,10 @@ wss.on('connection', (twilioWs) => {
 
       if (data.type === 'response.done') {
         assistantSpeaking = false;
-        console.log('Assistant finished speaking');
+        // Give a 600 ms cooldown after AI stops so its own audio tail can't
+        // trigger a false speech_started / speech_stopped event on the input.
+        ignoreCallerAudioUntil = Date.now() + 600;
+        console.log('Assistant finished speaking — cooldown started');
 
         if (pendingHangup) {
           pendingHangup                = false;
@@ -799,11 +805,21 @@ wss.on('connection', (twilioWs) => {
       }
 
       if (data.type === 'input_audio_buffer.speech_started') {
-        callerHasStartedSpeaking = true;
-        console.log('Caller started speaking');
+        if (Date.now() < ignoreCallerAudioUntil) {
+          console.log('speech_started ignored — within AI audio cooldown');
+        } else {
+          callerHasStartedSpeaking = true;
+          console.log('Caller started speaking');
+        }
       }
 
       if (data.type === 'input_audio_buffer.speech_stopped') {
+        if (Date.now() < ignoreCallerAudioUntil) {
+          console.log('speech_stopped ignored — within AI audio cooldown');
+          // Also clear the buffer so no stale audio gets processed
+          safeSendToOpenAI({ type: 'input_audio_buffer.clear' });
+          return;
+        }
         console.log('Caller stopped speaking');
 
         if (callerHasStartedSpeaking && !callBooked) {
