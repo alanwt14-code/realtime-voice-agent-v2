@@ -557,6 +557,11 @@ wss.on('connection', (twilioWs) => {
   openaiWs.on('open', () => {
     console.log('Connected to OpenAI Realtime');
 
+    // Flush any stale audio buffer so a fresh call never inherits
+    // audio or context from a previous session on this process.
+    safeSendToOpenAI({ type: 'input_audio_buffer.clear' });
+
+
     safeSendToOpenAI({
       type: 'session.update',
       session: {
@@ -846,7 +851,13 @@ wss.on('connection', (twilioWs) => {
         console.log('Caller number:', callerPhoneNumber || 'unknown');
         console.log('Call SID:', callSid || 'unknown');
 
+        // Update instructions with the real caller number now that we have it.
+        // We send ONLY instructions here — no other session fields — so OpenAI
+        // does not interpret this update as a cue to generate a new response.
+        // Also clear the input buffer one more time in case any audio arrived
+        // during the OpenAI handshake before Twilio sent the start event.
         if (callerPhoneNumber && openaiReady) {
+          safeSendToOpenAI({ type: 'input_audio_buffer.clear' });
           safeSendToOpenAI({
             type: 'session.update',
             session: { instructions: buildSessionInstructions(callerPhoneNumber) },
