@@ -6,69 +6,227 @@ const WebSocket = require('ws');
 const { google } = require('googleapis');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SETUP REQUIRED (before this works):
+// ENV VARIABLES NEEDED:
 //
-// 1. Run:  npm install googleapis
+//   TWILIO_ACCOUNT_SID
+//   TWILIO_AUTH_TOKEN
+//   TWILIO_PHONE_NUMBER        ← your Twilio number (SMS "from")
+//   OWNER_PHONE                ← your personal cell (receives owner summary SMS)
+//   OPENAI_API_KEY
 //
-// 2. Add to your .env file:
-//    GOOGLE_SERVICE_ACCOUNT_EMAIL=your-sa@your-project.iam.gserviceaccount.com
-//    GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-//    GOOGLE_CALENDAR_ID=your-calendar-id@group.calendar.google.com
+//   GOOGLE_SERVICE_ACCOUNT_EMAIL
+//   GOOGLE_PRIVATE_KEY
+//   GOOGLE_CALENDAR_ID
+//   GOOGLE_SHEET_ID            ← the ID from your Google Sheet URL
 //
-// 3. In Railway → Variables, add:
-//    TZ=America/New_York   ← change to your practice's timezone
-//    (This makes all JS Date methods use the right local time for your office)
+//   TZ=America/New_York        ← set in Railway variables
 //
-// See bottom of file for step-by-step Google Calendar setup instructions.
+// DEMO MODE:
+//   Set OWNER_PHONE to your personal number. Both the owner summary SMS and
+//   the customer confirmation SMS will go to that number so you can show
+//   both texts live during a demo.
+//   When going to production, change sendCustomerConfirmationText() so
+//   `to: OWNER_PHONE` becomes `to: phone`.
+//
+// See bottom of file for full Google Calendar + Sheets setup guide.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT       = process.env.PORT || 3000;
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
+const SHEET_ID    = process.env.GOOGLE_SHEET_ID    || '';
 
-// Twilio REST client — used to hang up the call after the closing summary
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const TWILIO_PHONE = process.env.TWILIO_PHONE_NUMBER || '';
+const OWNER_PHONE  = process.env.OWNER_PHONE || TWILIO_PHONE; // fallback if OWNER_PHONE not set
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Google Calendar Auth
+// Google Auth — single JWT used for both Calendar and Sheets
 // ─────────────────────────────────────────────────────────────────────────────
-const calendarAuth = new google.auth.JWT({
+const googleAuth = new google.auth.JWT({
   email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  scopes: ['https://www.googleapis.com/auth/calendar'],
+  key:   process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  scopes: [
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/spreadsheets',
+  ],
 });
 
-const calendarClient = google.calendar({ version: 'v3', auth: calendarAuth });
+const calendarClient = google.calendar({ version: 'v3', auth: googleAuth });
+const sheetsClient   = google.sheets({   version: 'v4', auth: googleAuth });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Business hours  (server uses local time — set TZ in Railway)
-// Keys: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
-// null = closed that day
+// Business hours
+// Keys: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat   null = closed
 // ─────────────────────────────────────────────────────────────────────────────
 const BUSINESS_HOURS = {
-  0: null,                     // Sunday  — closed
-  1: { open: 7, close: 16 },  // Monday
-  2: { open: 7, close: 16 },  // Tuesday
-  3: { open: 7, close: 16 },  // Wednesday
-  4: { open: 7, close: 16 },  // Thursday
-  5: { open: 7, close: 16 },  // Friday
-  6: { open: 9, close: 14 },  // Saturday
+  0: null,
+  1: { open: 7, close: 16 },
+  2: { open: 7, close: 16 },
+  3: { open: 7, close: 16 },
+  4: { open: 7, close: 16 },
+  5: { open: 7, close: 16 },
+  6: { open: 9, close: 14 },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Date helpers (all rely on TZ env being set correctly)
+// Google Sheets — log every booking as a new row
+//
+// Columns:  A=Timestamp  B=Patient Name  C=Phone  D=Reason
+//           E=Category   F=Patient Type  G=Appointment Date & Time
+// ─────────────────────────────────────────────────────────────────────────────
+async function logToSheet({ name, phone, reason, category, patientType, datetime }) {
+  if (!SHEET_ID) {
+    console.warn('GOOGLE_SHEET_ID not set — skipping sheet log');
+    return;
+  }
+
+  const tz = process.env.TZ || 'America/New_York';
+
+  const timestamp = new Date().toLocaleString('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+
+  const apptDate = new Date(datetime).toLocaleString('en-US', {
+    timeZone: tz, weekday: 'short', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+
+  const categoryLabels = { emergency: 'Emergency', high_value: 'High Value', routine: 'Routine' };
+
+  const row = [
+    timestamp,
+    name,
+    phone,
+    reason,
+    categoryLabels[category] || category,
+    patientType === 'new' ? 'New' : 'Existing',
+    apptDate,
+  ];
+
+  try {
+    await sheetsClient.spreadsheets.values.append({
+      spreadsheetId:    SHEET_ID,
+      range:            'Sheet1!A:G',
+      valueInputOption: 'USER_ENTERED',
+      requestBody:      { values: [row] },
+    });
+    console.log('Lead logged to Google Sheet');
+  } catch (err) {
+    console.error('Google Sheets log failed:', err.message); // non-fatal
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SMS helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NEW_PATIENT_BRING_LIST = [
+  '• Photo ID',
+  '• Insurance card / insurance info',
+  '• List of current medications',
+  '• Any previous dental records',
+  '• Arrive 15 min early for new patient paperwork',
+].join('\n');
+
+/**
+ * Owner summary SMS — sent to OWNER_PHONE (your personal number in demo mode).
+ */
+async function sendOwnerSummaryText({ name, phone, reason, category, patientType, datetime, durationMinutes }) {
+  if (!TWILIO_PHONE || !OWNER_PHONE) {
+    console.warn('TWILIO_PHONE or OWNER_PHONE not set — skipping owner SMS');
+    return;
+  }
+
+  const dateStr = new Date(datetime).toLocaleString('en-US', {
+    timeZone: process.env.TZ || 'America/New_York',
+    weekday: 'short', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+
+  const categoryLabels = { emergency: '🚨 EMERGENCY', high_value: '⭐ HIGH VALUE', routine: '📋 ROUTINE' };
+
+  const body = [
+    `📞 New Lead — Bright Smile Dental`,
+    ``,
+    `${categoryLabels[category] || category}`,
+    `Patient: ${name}`,
+    `Type:    ${patientType === 'new' ? 'New patient' : 'Existing patient'}`,
+    `Reason:  ${reason}`,
+    `Appt:    ${dateStr} (${durationMinutes} min)`,
+    `Phone:   ${phone}`,
+  ].join('\n');
+
+  try {
+    await twilioClient.messages.create({ body, from: TWILIO_PHONE, to: OWNER_PHONE });
+    console.log(`Owner summary SMS sent to ${OWNER_PHONE}`);
+  } catch (err) {
+    console.error('Owner SMS failed:', err.message); // non-fatal
+  }
+}
+
+/**
+ * Customer confirmation SMS.
+ *
+ * DEMO MODE:   `to: OWNER_PHONE`  — both texts land on your phone.
+ * PRODUCTION:  change to `to: phone` to send to the real caller.
+ *
+ * New patients also receive the "what to bring" list.
+ */
+async function sendCustomerConfirmationText({ name, phone, reason, patientType, datetime, durationMinutes }) {
+  if (!TWILIO_PHONE) {
+    console.warn('TWILIO_PHONE not set — skipping customer SMS');
+    return;
+  }
+
+  const dateStr = new Date(datetime).toLocaleString('en-US', {
+    timeZone: process.env.TZ || 'America/New_York',
+    weekday: 'long', month: 'long', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+
+  const firstName = name.split(' ')[0];
+
+  const lines = [
+    `Hi ${firstName}! This is Bright Smile Dental confirming your appointment.`,
+    ``,
+    `📅 ${reason}`,
+    `🕐 ${dateStr} (${durationMinutes} min)`,
+    ``,
+    `Questions? Call us back at this number.`,
+  ];
+
+  if (patientType === 'new') {
+    lines.push('');
+    lines.push(`Since you're a new patient, please remember to bring:`);
+    lines.push(NEW_PATIENT_BRING_LIST);
+  }
+
+  lines.push('');
+  lines.push(`— Bright Smile Dental`);
+
+  try {
+    // DEMO MODE: routes to OWNER_PHONE so you see both texts on one device.
+    // PRODUCTION: replace `OWNER_PHONE` with `phone` to text the real caller.
+    await twilioClient.messages.create({ body: lines.join('\n'), from: TWILIO_PHONE, to: OWNER_PHONE });
+    console.log(`Customer confirmation SMS sent to ${OWNER_PHONE} (demo mode)`);
+  } catch (err) {
+    console.error('Customer SMS failed:', err.message); // non-fatal
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Date helpers
 // ─────────────────────────────────────────────────────────────────────────────
 function snapToNext30(date) {
   const m = date.getMinutes();
   if (m === 0) return;
-  if (m <= 30) {
-    date.setMinutes(30, 0, 0);
-  } else {
-    date.setHours(date.getHours() + 1, 0, 0, 0);
-  }
+  if (m <= 30) date.setMinutes(30, 0, 0);
+  else date.setHours(date.getHours() + 1, 0, 0, 0);
 }
 
 function advanceToNextBusinessOpen(date) {
@@ -81,73 +239,41 @@ function advanceToNextBusinessOpen(date) {
 }
 
 function formatSlotForSpeech(date) {
-  const now = new Date();
-  const isToday = date.toDateString() === now.toDateString();
+  const now      = new Date();
   const tomorrow = new Date(now);
   tomorrow.setDate(tomorrow.getDate() + 1);
-  const isTomorrow = date.toDateString() === tomorrow.toDateString();
-
-  const timeStr = date.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true,
-  });
-
-  if (isToday) return `today at ${timeStr}`;
-  if (isTomorrow) return `tomorrow at ${timeStr}`;
+  const timeStr  = date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  if (date.toDateString() === now.toDateString())      return `today at ${timeStr}`;
+  if (date.toDateString() === tomorrow.toDateString()) return `tomorrow at ${timeStr}`;
   return `${date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })} at ${timeStr}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Availability logic
-//
-// Priority:  emergency (#1) > high_value (#2) > routine (#3)
-//
-// emergency  — same day if possible, up to 48 hours out, 60 min, 2 options
-// high_value — within 5 days, 60 min consult, 3 options (spread across days)
-// routine    — up to 4 weeks, 60 min (75 min for new patient cleaning), 3 options
 // ─────────────────────────────────────────────────────────────────────────────
 async function getAvailableSlots(category, patientType, reason, timePreference = 'any', daysOffset = 0) {
-  let durationMinutes, searchHours;
-  const maxOptions = 2; // Always offer exactly 2 options
+  const durationMinutes = 60;
+  const maxOptions      = 2;
 
-  // All appointments are 60 minutes regardless of category or patient type
-  durationMinutes = 60;
-
-  if (category === 'emergency') {
-    searchHours = 48;
-  } else if (category === 'high_value') {
-    searchHours = 5 * 24;
-  } else { // routine
-    searchHours = 28 * 24;
-  }
+  let searchHours;
+  if (category === 'emergency')       searchHours = 48;
+  else if (category === 'high_value') searchHours = 5 * 24;
+  else                                searchHours = 28 * 24;
 
   const now = new Date();
 
-  // If caller requested a future week/date, shift the search window forward.
-  // searchStart = the later of (now) or (now + daysOffset days at midnight).
-  // searchEnd extends searchHours from searchStart so we still scan a full window.
   let searchStart = new Date(now);
   if (daysOffset > 0) {
-    searchStart = new Date(now);
     searchStart.setDate(searchStart.getDate() + daysOffset);
-    searchStart.setHours(0, 0, 0, 0); // start of that day
-
-    // Snap back to Monday of the target week so we never skip Mon/Tue/etc.
-    // getDay(): 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+    searchStart.setHours(0, 0, 0, 0);
     const dow = searchStart.getDay();
-    const daysToMonday = dow === 0 ? -6 : 1 - dow; // negative = go back, 0 = already Mon
-    if (daysToMonday < 0) {
-      searchStart.setDate(searchStart.getDate() + daysToMonday);
-    }
-
-    // Extend search window so it covers at least a full week from searchStart
+    const daysToMonday = dow === 0 ? -6 : 1 - dow;
+    if (daysToMonday < 0) searchStart.setDate(searchStart.getDate() + daysToMonday);
     const minEnd = new Date(searchStart.getTime() + 7 * 24 * 60 * 60 * 1000);
     searchHours  = Math.max(searchHours, (minEnd - now) / (60 * 60 * 1000));
   }
   const searchEnd = new Date(now.getTime() + searchHours * 60 * 60 * 1000);
 
-  // Fetch busy times from Google Calendar (always query from now so we have full context)
   const freebusyRes = await calendarClient.freebusy.query({
     requestBody: {
       timeMin: now.toISOString(),
@@ -157,111 +283,57 @@ async function getAvailableSlots(category, patientType, reason, timePreference =
   });
 
   const busyTimes = (freebusyRes.data.calendars[CALENDAR_ID]?.busy || []).map(b => ({
-    start: new Date(b.start),
-    end:   new Date(b.end),
+    start: new Date(b.start), end: new Date(b.end),
   }));
 
-  // Build starting point — use searchStart (respects daysOffset)
   const current = new Date(searchStart);
   if (daysOffset === 0 && category === 'emergency') {
-    // Give a 30-minute buffer for same-day emergencies
     current.setTime(Math.max(current.getTime(), now.getTime() + 30 * 60 * 1000));
   }
-  if (daysOffset === 0) {
-    snapToNext30(current);
-  } else {
-    // Jump straight to the first open business hour on or after searchStart
+  if (daysOffset === 0) snapToNext30(current);
+  else {
     const h = BUSINESS_HOURS[current.getDay()];
-    if (!h) {
-      advanceToNextBusinessOpen(current);
-    } else {
-      current.setHours(h.open, 0, 0, 0);
-    }
+    if (!h) advanceToNextBusinessOpen(current);
+    else current.setHours(h.open, 0, 0, 0);
   }
 
   const slots = [];
-  let safety   = 0;
+  let safety  = 0;
 
   while (slots.length < maxOptions && current < searchEnd && safety++ < 500) {
     const dayHours = BUSINESS_HOURS[current.getDay()];
+    if (!dayHours) { advanceToNextBusinessOpen(current); continue; }
+    if (current.getHours() < dayHours.open) { current.setHours(dayHours.open, 0, 0, 0); continue; }
 
-    // Closed today — jump to next open day
-    if (!dayHours) {
-      advanceToNextBusinessOpen(current);
-      continue;
-    }
-
-    // Before opening — jump to open time
-    if (current.getHours() < dayHours.open) {
-      current.setHours(dayHours.open, 0, 0, 0);
-      continue;
-    }
-
-    // Time preference filtering
     const currentHour = current.getHours();
-    if (timePreference === 'morning' && currentHour >= 12) {
-      // Already past noon — jump to next business day
-      advanceToNextBusinessOpen(current);
-      continue;
-    }
-    if (timePreference === 'afternoon' && currentHour < 12) {
-      // Before noon — jump to 12:00 PM today
-      current.setHours(12, 0, 0, 0);
-      continue;
-    }
+    if (timePreference === 'morning'   && currentHour >= 12) { advanceToNextBusinessOpen(current); continue; }
+    if (timePreference === 'afternoon' && currentHour <  12) { current.setHours(12, 0, 0, 0); continue; }
 
     const slotEnd        = new Date(current.getTime() + durationMinutes * 60 * 1000);
     const slotEndMinutes = slotEnd.getHours() * 60 + slotEnd.getMinutes();
+    if (slotEndMinutes > dayHours.close * 60) { advanceToNextBusinessOpen(current); continue; }
 
-    // Slot would run past closing — jump to next open day
-    if (slotEndMinutes > dayHours.close * 60) {
-      advanceToNextBusinessOpen(current);
-      continue;
-    }
-
-    // Check for calendar conflicts
     const conflict = busyTimes.find(b => current < b.end && slotEnd > b.start);
-
     if (!conflict) {
-      // ✅ Slot is open — add it
       slots.push(new Date(current));
-
-      if (category === 'emergency') {
-        // Pack emergency slots close together (same day preferred)
-        current.setTime(slotEnd.getTime());
-        snapToNext30(current);
-      } else {
-        // Spread routine/high_value options across different days
-        advanceToNextBusinessOpen(current);
-      }
+      if (category === 'emergency') { current.setTime(slotEnd.getTime()); snapToNext30(current); }
+      else advanceToNextBusinessOpen(current);
     } else {
-      // Jump past the conflict and try again
       current.setTime(conflict.end.getTime());
       snapToNext30(current);
     }
   }
 
-  return {
-    slots,
-    durationMinutes,
-    formatted: slots.map(formatSlotForSpeech),
-  };
+  return { slots, durationMinutes, formatted: slots.map(formatSlotForSpeech) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Create a Google Calendar appointment
-// Color coding: emergency = red, high_value = yellow, routine = green
-//
-// Includes a final conflict re-check right before inserting to prevent
-// double-booking in the race condition where two callers pick the same slot.
 // ─────────────────────────────────────────────────────────────────────────────
 async function createAppointment({ name, phone, reason, category, patientType, datetime, durationMinutes }) {
   const startTime = new Date(datetime);
   const endTime   = new Date(startTime.getTime() + durationMinutes * 60 * 1000);
 
-  // ── Final conflict check (race condition guard) ──────────────────────────
-  // Re-check the exact slot one last time right before inserting.
-  // If another caller just booked it between check_availability and now, we catch it here.
   const conflictCheck = await calendarClient.freebusy.query({
     requestBody: {
       timeMin: startTime.toISOString(),
@@ -270,12 +342,7 @@ async function createAppointment({ name, phone, reason, category, patientType, d
     },
   });
 
-  const conflicts = conflictCheck.data.calendars[CALENDAR_ID]?.busy || [];
-  if (conflicts.length > 0) {
-    // Slot was taken between when we offered it and now
-    throw new Error('SLOT_TAKEN');
-  }
-  // ─────────────────────────────────────────────────────────────────────────
+  if ((conflictCheck.data.calendars[CALENDAR_ID]?.busy || []).length > 0) throw new Error('SLOT_TAKEN');
 
   const labels = { emergency: '🚨 EMERGENCY', high_value: '⭐ HIGH VALUE', routine: '📋 ROUTINE' };
   const colors = { emergency: '11', high_value: '5', routine: '2' };
@@ -283,12 +350,8 @@ async function createAppointment({ name, phone, reason, category, patientType, d
   const event = {
     summary: `${labels[category]} — ${name} (${reason})`,
     description: [
-      `Patient: ${name}`,
-      `Phone: ${phone}`,
-      `Reason: ${reason}`,
-      `Type: ${patientType} patient`,
-      `Category: ${category}`,
-      `Booked via AI Voice Agent`,
+      `Patient: ${name}`, `Phone: ${phone}`, `Reason: ${reason}`,
+      `Type: ${patientType} patient`, `Category: ${category}`, `Booked via AI Voice Agent`,
     ].join('\n'),
     start: { dateTime: startTime.toISOString(), timeZone: process.env.TZ || 'America/New_York' },
     end:   { dateTime: endTime.toISOString(),   timeZone: process.env.TZ || 'America/New_York' },
@@ -308,16 +371,8 @@ app.post('/voice', (req, res) => {
   const twiml   = new twilio.twiml.VoiceResponse();
   const connect = twiml.connect();
   const stream  = connect.stream({ url: `wss://${req.headers.host}/ws` });
-
-  // Pass the caller's phone number into the WebSocket session as a custom parameter
-  if (req.body.From) {
-    stream.parameter({ name: 'callerNumber', value: req.body.From });
-  }
-
-  // When the stream WebSocket closes, Twilio executes <Hangup> and ends the call.
-  // This ensures closing the WebSocket from our side is enough to hang up.
+  if (req.body.From) stream.parameter({ name: 'callerNumber', value: req.body.From });
   twiml.hangup();
-
   res.type('text/xml');
   res.send(twiml.toString());
 });
@@ -325,10 +380,13 @@ app.post('/voice', (req, res) => {
 const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Build session instructions (called once at open, updated when caller number arrives)
+// Build session instructions
 // ─────────────────────────────────────────────────────────────────────────────
 function buildSessionInstructions(callerPhone) {
-  const displayPhone = callerPhone || 'the number you called from';
+  const displayPhone = callerPhone
+    ? callerPhone
+    : '[CALLER_NUMBER_PENDING — do NOT say this aloud, wait for it to be set]';
+
   return `
 You are a warm, friendly dental receptionist at Bright Smile Dental — like a real person answering the phone, not a robot.
 Speak English only. Never invent the caller's side of the conversation.
@@ -336,7 +394,7 @@ Speak English only. Never invent the caller's side of the conversation.
 SOUND HUMAN:
 - Use natural acknowledgments: "Of course!", "Sure thing!", "Absolutely!", "Perfect!", "Okay!"
 - Use contractions always: "we'll", "I'll", "you're", "that's", "let's", "don't"
-- React naturally to what they say before moving on — e.g. if someone says they're in pain, say "Oh no, I'm sorry to hear that — let's get you taken care of right away."
+- React naturally to what they say before moving on
 - Vary your phrasing — don't repeat the same sentence structure every time
 - Keep responses short and natural, like a real phone call — no long speeches
 - Light filler is fine: "Let me check that for you", "One moment", "Great"
@@ -416,32 +474,24 @@ const wss = new WebSocket.Server({ server });
 wss.on('connection', (twilioWs) => {
   console.log('Twilio connected');
 
-  let streamSid               = null;
-  let callSid                 = null; // Twilio CallSid — needed to hang up via REST API
-  let callerPhoneNumber       = null; // populated from Twilio caller ID
-  let openaiReady             = false;
-  let greetingSent            = false;
-  let callClosed              = false;
+  let streamSid                    = null;
+  let callSid                      = null;
+  let callerPhoneNumber            = null;
+  let openaiReady                  = false;
+  let greetingSent                 = false;
+  let callClosed                   = false;
   let callBooked                   = false;
   let pendingHangup                = false;
   let waitingForTwilioPlaybackMark = false;
   const FINAL_PLAYBACK_MARK        = 'final-summary-played';
   let assistantSpeaking            = false;
-  let callerHasStartedSpeaking = false;
+  let callerHasStartedSpeaking     = false;
 
-  // Phase tracker — controls exactly what the AI is told to do each turn
-  // 'collecting'       → gathering name, patient type, time preference
-  // 'slots_offered'    → 2 slots read aloud, waiting for caller to pick one
-  // 'confirming_phone' → phone confirmation question asked, waiting for yes/no
-  // 'done'             → booking complete
-  let callPhase = 'collecting';
-  let pendingCallerResponse   = false;
+  let callPhase             = 'collecting';
+  let pendingCallerResponse = false;
+  let offeredSlots          = [];
+  let bookedAppointment     = null; // populated after successful book_appointment
 
-  // Slot validation: store the slots we offered so we can verify the AI only books one of them
-  // Each entry: { iso: string, durationMinutes: number }
-  let offeredSlots = [];
-
-  // Tool call tracking
   let currentFunctionName    = null;
   let currentFunctionCallId  = null;
   let functionCallArgsBuffer = '';
@@ -459,38 +509,27 @@ wss.on('connection', (twilioWs) => {
   function doHangup() {
     if (callClosed) return;
     console.log('doHangup called — callSid:', callSid);
-    // Try REST API first (cleanest), always close WebSocket too as guaranteed fallback.
-    // The TwiML <Hangup> after the stream ensures WebSocket close = call end.
     if (callSid) {
       twilioClient.calls(callSid).update({ status: 'completed' })
         .then(() => console.log('Call ended via REST API'))
         .catch(err => console.error('REST hangup failed:', err.message));
     }
-    // Always close WebSocket regardless — belt and suspenders
     setTimeout(() => {
-      if (!callClosed) {
-        console.log('Closing WebSocket to end call');
-        twilioWs.close();
-      }
+      if (!callClosed) { console.log('Closing WebSocket to end call'); twilioWs.close(); }
     }, 1500);
   }
 
   function sendTwilioMark(name) {
-    if (!callClosed && twilioWs.readyState === WebSocket.OPEN && streamSid) {
+    if (!callClosed && twilioWs.readyState === WebSocket.OPEN && streamSid)
       twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name } }));
-    }
   }
 
   function safeSendToOpenAI(payload) {
-    if (!callClosed && openaiWs.readyState === WebSocket.OPEN) {
-      openaiWs.send(JSON.stringify(payload));
-    }
+    if (!callClosed && openaiWs.readyState === WebSocket.OPEN) openaiWs.send(JSON.stringify(payload));
   }
 
   function safeSendToTwilio(payload) {
-    if (!callClosed && twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.send(JSON.stringify(payload));
-    }
+    if (!callClosed && twilioWs.readyState === WebSocket.OPEN) twilioWs.send(JSON.stringify(payload));
   }
 
   function createAssistantResponse(instructionsText) {
@@ -522,7 +561,7 @@ wss.on('connection', (twilioWs) => {
       type: 'session.update',
       session: {
         modalities: ['audio', 'text'],
-        instructions: buildSessionInstructions(null), // updated with caller number after Twilio start event
+        instructions: buildSessionInstructions(null),
         voice: 'sage',
         temperature: 0.9,
         input_audio_format: 'g711_ulaw',
@@ -543,28 +582,11 @@ wss.on('connection', (twilioWs) => {
             parameters: {
               type: 'object',
               properties: {
-                category: {
-                  type: 'string',
-                  enum: ['emergency', 'high_value', 'routine'],
-                  description: 'emergency = urgent pain/trauma. high_value = cosmetic/implants. routine = checkup/cleaning.',
-                },
-                patient_type: {
-                  type: 'string',
-                  enum: ['new', 'existing'],
-                },
-                reason: {
-                  type: 'string',
-                  description: 'Brief description of why they are calling.',
-                },
-                time_preference: {
-                  type: 'string',
-                  enum: ['morning', 'afternoon', 'any'],
-                  description: 'morning = 7am-12pm, afternoon = 12pm-4pm, any = no preference.',
-                },
-                days_offset: {
-                  type: 'number',
-                  description: 'How many days from today to start searching. Use 0 (default) for soonest available. Use 7 for "next week", 14 for "in two weeks", etc. If the caller says "next week" or "not until next week", set this to 7. If they say "in two weeks", set to 14.',
-                },
+                category:        { type: 'string', enum: ['emergency', 'high_value', 'routine'], description: 'emergency = urgent pain/trauma. high_value = cosmetic/implants. routine = checkup/cleaning.' },
+                patient_type:    { type: 'string', enum: ['new', 'existing'] },
+                reason:          { type: 'string', description: 'Brief description of why they are calling.' },
+                time_preference: { type: 'string', enum: ['morning', 'afternoon', 'any'], description: 'morning = 7am-12pm, afternoon = 12pm-4pm, any = no preference.' },
+                days_offset:     { type: 'number', description: 'Days from today to start searching. 0 = soonest. 7 = next week. 14 = in two weeks.' },
               },
               required: ['category', 'patient_type', 'reason', 'time_preference'],
             },
@@ -576,8 +598,8 @@ wss.on('connection', (twilioWs) => {
             parameters: {
               type: 'object',
               properties: {
-                name:             { type: 'string', description: 'Caller\'s full name.' },
-                phone:            { type: 'string', description: 'Caller\'s callback phone number.' },
+                name:             { type: 'string', description: "Caller's full name." },
+                phone:            { type: 'string', description: "Caller's callback phone number." },
                 reason:           { type: 'string', description: 'Reason for the visit.' },
                 category:         { type: 'string', enum: ['emergency', 'high_value', 'routine'] },
                 patient_type:     { type: 'string', enum: ['new', 'existing'] },
@@ -590,7 +612,7 @@ wss.on('connection', (twilioWs) => {
           {
             type: 'function',
             name: 'end_call',
-            description: 'End the call. Call this immediately after finishing the closing summary — after saying "have a great day". No parameters needed.',
+            description: 'End the call. Call this immediately after finishing the closing summary. No parameters needed.',
             parameters: { type: 'object', properties: {}, required: [] },
           },
         ],
@@ -606,29 +628,21 @@ wss.on('connection', (twilioWs) => {
     try {
       const data = JSON.parse(message.toString());
 
-      if (data.type !== 'response.audio.delta') {
-        console.log('OpenAI event:', data.type);
-      }
+      if (data.type !== 'response.audio.delta') console.log('OpenAI event:', data.type);
 
-      // Stream audio back to Twilio
-      if (data.type === 'response.audio.delta' && data.delta && streamSid) {
+      if (data.type === 'response.audio.delta' && data.delta && streamSid)
         safeSendToTwilio({ event: 'media', streamSid, media: { payload: data.delta } });
-      }
 
-      // Track function call name + ID when a tool call starts
       if (data.type === 'response.output_item.added' && data.item?.type === 'function_call') {
-        currentFunctionName   = data.item.name;
-        currentFunctionCallId = data.item.call_id;
+        currentFunctionName    = data.item.name;
+        currentFunctionCallId  = data.item.call_id;
         functionCallArgsBuffer = '';
         console.log(`Tool call started: ${currentFunctionName}`);
       }
 
-      // Buffer streaming arguments
-      if (data.type === 'response.function_call_arguments.delta') {
+      if (data.type === 'response.function_call_arguments.delta')
         functionCallArgsBuffer += data.delta;
-      }
 
-      // Execute tool when arguments are fully received
       if (data.type === 'response.function_call_arguments.done') {
         const args   = JSON.parse(functionCallArgsBuffer);
         const fnName = currentFunctionName;
@@ -637,157 +651,139 @@ wss.on('connection', (twilioWs) => {
 
         let result;
         try {
+
+          // ── end_call ──────────────────────────────────────────────────────
           if (fnName === 'end_call') {
-            console.log('end_call received — will hang up after final audio finishes');
+            console.log('end_call received — firing SMS + sheet log, then hanging up');
             pendingHangup = true;
             result = { success: true };
+
             safeSendToOpenAI({
               type: 'conversation.item.create',
               item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) },
             });
-            return; // do not hang up yet — wait for response.done
 
+            // Fire all three post-call actions in parallel — all non-fatal
+            if (bookedAppointment) {
+              Promise.all([
+                sendOwnerSummaryText(bookedAppointment),
+                sendCustomerConfirmationText(bookedAppointment),
+                logToSheet(bookedAppointment),
+              ]).catch(err => console.error('Post-call action error:', err.message));
+            }
+
+            return; // hang up after response.done + Twilio mark
+
+          // ── check_availability ────────────────────────────────────────────
           } else if (fnName === 'check_availability') {
-            const availability = await getAvailableSlots(args.category, args.patient_type, args.reason, args.time_preference || 'any', args.days_offset || 0);
+            const availability = await getAvailableSlots(
+              args.category, args.patient_type, args.reason,
+              args.time_preference || 'any', args.days_offset || 0
+            );
 
-            // Store offered slots server-side so we can validate the booking later
             offeredSlots = availability.slots.map(s => ({
-              iso:             s.toISOString(),
-              durationMinutes: availability.durationMinutes,
+              iso: s.toISOString(), durationMinutes: availability.durationMinutes,
             }));
 
             result = {
-              success:          true,
-              category:         args.category,
+              success: true, category: args.category,
               duration_minutes: availability.durationMinutes,
-              slots:            availability.slots.map(s => s.toISOString()),
-              formatted_slots:  availability.formatted, // human-readable for the AI to read aloud
+              slots:           availability.slots.map(s => s.toISOString()),
+              formatted_slots: availability.formatted,
             };
 
+          // ── book_appointment ──────────────────────────────────────────────
           } else if (fnName === 'book_appointment') {
-
-            // Use the exact ISO datetime from the offeredSlots we gave the AI.
-            // Find the closest matching offered slot and use that datetime
-            // to avoid timezone mismatch between what we stored and what the AI sends back.
             const requestedMs = new Date(args.datetime).getTime();
             const closestSlot = offeredSlots.reduce((best, s) => {
               const diff = Math.abs(new Date(s.iso).getTime() - requestedMs);
               return (!best || diff < best.diff) ? { slot: s, diff } : best;
             }, null);
 
-            const datetimeToBook     = closestSlot ? closestSlot.slot.iso : args.datetime;
-            const durationToBook     = closestSlot ? closestSlot.slot.durationMinutes : args.duration_minutes;
+            const datetimeToBook = closestSlot ? closestSlot.slot.iso             : args.datetime;
+            const durationToBook = closestSlot ? closestSlot.slot.durationMinutes : args.duration_minutes;
 
-            // Use the phone number the AI confirmed with the caller.
-            // If the caller gave a different number, the AI will send that.
-            // Fall back to callerPhoneNumber if AI sends nothing useful.
             const phoneToUse = (args.phone && args.phone !== 'TO_BE_CONFIRMED' && args.phone !== 'unknown')
-              ? args.phone
-              : (callerPhoneNumber || 'unknown');
+              ? args.phone : (callerPhoneNumber || 'unknown');
 
-            // Set callBooked=true BEFORE the async Google Calendar call so that
-            // response.done for the tool-call response (which arrives during the await)
-            // gets counted correctly. Reset to false in catch if booking fails.
             offeredSlots = [];
             callBooked   = true;
 
             const event = await createAppointment({
-              name:            args.name,
-              phone:           phoneToUse,
-              reason:          args.reason,
-              category:        args.category,
-              patientType:     args.patient_type,
-              datetime:        datetimeToBook,
-              durationMinutes: durationToBook,
+              name: args.name, phone: phoneToUse, reason: args.reason,
+              category: args.category, patientType: args.patient_type,
+              datetime: datetimeToBook, durationMinutes: durationToBook,
             });
+
+            // Store for post-call SMS + sheet log
+            bookedAppointment = {
+              name: args.name, phone: phoneToUse, reason: args.reason,
+              category: args.category, patientType: args.patient_type,
+              datetime: datetimeToBook, durationMinutes: durationToBook,
+            };
+
             result = { success: true, event_id: event.id, message: 'Appointment booked successfully.' };
           }
+
         } catch (err) {
           console.error(`Tool ${fnName} failed:`, err.message);
+          if (fnName === 'book_appointment') { callBooked = false; bookedAppointment = null; }
 
-          // Reset booking flags if the appointment creation failed
-          if (fnName === 'book_appointment') {
-            callBooked = false;
-          }
-
-          // Handle slot-taken race condition gracefully
-          if (err.message === 'SLOT_TAKEN') {
-            result = {
-              success: false,
-              error:   'SLOT_TAKEN',
-              message: 'That slot was just taken by another caller. Call check_availability again to get fresh available times and offer them to the caller.',
-            };
-          } else {
-            result = { success: false, error: err.message };
-          }
+          result = err.message === 'SLOT_TAKEN'
+            ? { success: false, error: 'SLOT_TAKEN', message: 'That slot was just taken. Call check_availability again to get fresh times.' }
+            : { success: false, error: err.message };
         }
 
         console.log(`${fnName} result:`, result);
 
-        // Send result back to OpenAI
         safeSendToOpenAI({
           type: 'conversation.item.create',
-          item: {
-            type:    'function_call_output',
-            call_id: callId,
-            output:  JSON.stringify(result),
-          },
+          item: { type: 'function_call_output', call_id: callId, output: JSON.stringify(result) },
         });
 
-        // Give the AI explicit instructions for what to do next based on the tool result
         if (fnName === 'check_availability') {
-          if (result.success) {
-            callPhase = 'slots_offered';
-            createAssistantResponse(
-              'The calendar has been checked. Read ONLY the 2 time options from formatted_slots to the caller. Say something like "I have [slot 1] or [slot 2] — which works better for you?" Then STOP. Do not mention the phone number. Do not call book_appointment. Just offer the 2 slots and wait for the caller to choose.'
-            );
-          } else {
-            createAssistantResponse(
-              'The calendar check failed. Apologize briefly and tell the caller you\'re having trouble accessing the schedule, then ask them to call back or leave a number for a callback.'
-            );
-          }
+          callPhase = result.success ? 'slots_offered' : callPhase;
+          createAssistantResponse(result.success
+            ? 'The calendar has been checked. Read ONLY the 2 time options from formatted_slots to the caller. Say something like "I have [slot 1] or [slot 2] — which works better for you?" Then STOP. Do not mention the phone number. Do not call book_appointment. Just offer the 2 slots and wait for the caller to choose.'
+            : "The calendar check failed. Apologize briefly and tell the caller you're having trouble accessing the schedule, then ask them to call back or leave a number for a callback."
+          );
+
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              'The appointment is confirmed. Say the closing summary out loud: use their full name, confirm the reason, date, time, and the phone number we have on file. End with "We\'ll see you then — thank you, and have a great day!" Then immediately call the end_call tool. Do not say anything else.'
+              "The appointment is confirmed. Say the closing summary out loud: use their full name, confirm the reason, date, time, and the phone number we have on file. End with \"We'll see you then — thank you, and have a great day!\" Then immediately call the end_call tool. Do not say anything else."
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
               'That slot was just taken by another caller. Say: "Sorry about that — that time just got taken. Let me find you some fresh options." Then call check_availability again with the same details and offer the new 2 slots.'
             );
           } else {
-            createAssistantResponse(
-              'The booking failed. Apologize and call check_availability again to offer fresh time options to the caller.'
-            );
+            createAssistantResponse('The booking failed. Apologize and call check_availability again to offer fresh time options to the caller.');
           }
         }
       }
 
       if (data.type === 'response.done') {
         assistantSpeaking        = false;
-        callerHasStartedSpeaking = false; // reset so stale detections during AI speech don't auto-trigger
+        callerHasStartedSpeaking = false;
         console.log('Assistant finished speaking');
 
         if (pendingHangup) {
-          pendingHangup = false;
+          pendingHangup                = false;
           waitingForTwilioPlaybackMark = true;
           console.log('OpenAI done — sending Twilio mark, waiting for playback to finish');
           sendTwilioMark(FINAL_PLAYBACK_MARK);
           return;
         }
 
-        // If caller spoke while AI was still talking, respond now that AI is done
         if (pendingCallerResponse) {
           pendingCallerResponse = false;
-          // Caller interrupted while AI was speaking — do NOT advance the phase.
-          // Just let the AI respond naturally to what the caller said and continue from where it was.
           createAssistantResponse(
             'The caller spoke while you were talking. Listen to what they said and respond naturally. Continue with whatever you were in the middle of asking them — do not skip ahead. One question at a time.'
           );
         }
       }
 
-      // Always track when caller starts speaking (including during interruptions)
       if (data.type === 'input_audio_buffer.speech_started') {
         callerHasStartedSpeaking = true;
         console.log('Caller started speaking');
@@ -796,43 +792,34 @@ wss.on('connection', (twilioWs) => {
       if (data.type === 'input_audio_buffer.speech_stopped') {
         console.log('Caller stopped speaking');
 
-        // Once booked, only allow responses for the phone confirmation — block tool-triggering responses after that
-        // (tool re-booking is blocked separately in the tool execution block)
-
         if (callerHasStartedSpeaking && !callBooked) {
           if (!assistantSpeaking) {
-            // Build the instruction based on where we are in the call
             let instruction;
 
             if (callPhase === 'slots_offered') {
-              // Caller just picked a time — now ask phone confirmation ONLY, do not book
               callPhase = 'confirming_phone';
               const phoneDisplay = callerPhoneNumber || 'the number you called from';
               instruction = `The caller just picked a time slot. Do NOT call book_appointment yet. Ask ONLY this one question: "I have ${phoneDisplay} as the best number to reach you — is that correct?" Then STOP and wait for their answer. Do not book. Do not say anything else.`;
 
             } else if (callPhase === 'confirming_phone') {
-              // Caller just answered yes/no to the phone confirmation — now book
               callPhase = 'done';
               const phoneDisplay = callerPhoneNumber || 'unknown';
               instruction = `The caller just responded to the phone confirmation. If they said yes, call book_appointment using phone="${phoneDisplay}". If they said no or gave a different number, use that new number instead. Call book_appointment now with the correct phone, full name, reason, category, patient_type, datetime (exact ISO string from the slots array), and duration_minutes.`;
 
             } else {
-              // Normal info-gathering phase
-              instruction = 'Respond in English as the dental receptionist. Continue from the caller\'s last message. Follow the session flow: understand issue → full name (first and last) → new/existing → morning or afternoon preference → call check_availability. NEVER ask for a phone number. One question at a time.';
+              instruction = "Respond in English as the dental receptionist. Continue from the caller's last message. Follow the session flow: understand issue → full name (first and last) → new/existing → morning or afternoon preference → call check_availability. NEVER ask for a phone number. One question at a time.";
             }
 
             createAssistantResponse(instruction);
           } else {
-            // Interruption: AI is still finishing — flag it and respond once done
             pendingCallerResponse = true;
             console.log('Caller interrupted — will respond after AI finishes');
           }
         }
       }
 
-      if (data.type === 'error') {
-        console.error('OpenAI error:', JSON.stringify(data, null, 2));
-      }
+      if (data.type === 'error') console.error('OpenAI error:', JSON.stringify(data, null, 2));
+
     } catch (error) {
       console.error('Error processing OpenAI message:', error.message);
     }
@@ -841,10 +828,7 @@ wss.on('connection', (twilioWs) => {
   twilioWs.on('message', (message) => {
     try {
       const data = JSON.parse(message.toString());
-
-      if (data.event !== 'media') {
-        console.log('Twilio event:', data.event);
-      }
+      if (data.event !== 'media') console.log('Twilio event:', data.event);
 
       if (data.event === 'start') {
         streamSid         = data.start.streamSid;
@@ -853,23 +837,18 @@ wss.on('connection', (twilioWs) => {
         console.log('Caller number:', callerPhoneNumber || 'unknown');
         console.log('Call SID:', callSid || 'unknown');
 
-        // Now that we have the caller's number, update the session instructions
-        // so the AI knows to skip asking for it and confirm it at the end instead
         if (callerPhoneNumber && openaiReady) {
           safeSendToOpenAI({
             type: 'session.update',
-            session: {
-              instructions: buildSessionInstructions(callerPhoneNumber),
-            },
+            session: { instructions: buildSessionInstructions(callerPhoneNumber) },
           });
         }
 
         sendGreeting();
       }
 
-      if (data.event === 'media') {
+      if (data.event === 'media')
         safeSendToOpenAI({ type: 'input_audio_buffer.append', audio: data.media.payload });
-      }
 
       if (data.event === 'mark') {
         const markName = data.mark?.name;
@@ -881,9 +860,8 @@ wss.on('connection', (twilioWs) => {
         }
       }
 
-      if (data.event === 'stop') {
-        console.log('Twilio stream stopped');
-      }
+      if (data.event === 'stop') console.log('Twilio stream stopped');
+
     } catch (error) {
       console.error('Error processing Twilio message:', error.message);
     }
@@ -892,9 +870,8 @@ wss.on('connection', (twilioWs) => {
   twilioWs.on('close', () => {
     callClosed = true;
     console.log('Call ended');
-    if (openaiWs.readyState === WebSocket.OPEN || openaiWs.readyState === WebSocket.CONNECTING) {
+    if (openaiWs.readyState === WebSocket.OPEN || openaiWs.readyState === WebSocket.CONNECTING)
       openaiWs.close();
-    }
   });
 
   openaiWs.on('close', () => console.log('OpenAI connection closed'));
@@ -903,44 +880,92 @@ wss.on('connection', (twilioWs) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GOOGLE CALENDAR SETUP (do this once to connect your demo calendar)
+// SETUP GUIDE
+// ─────────────────────────────────────────────────────────────────────────────
 //
-// STEP 1 — Create a Google Cloud project
-//   → Go to: https://console.cloud.google.com
-//   → Create a new project (name it anything, e.g. "Dental Voice Agent")
+// ══════════════════════════════════════════════════════
+// PART 1 — GOOGLE CLOUD (one-time, covers both services)
+// ══════════════════════════════════════════════════════
 //
-// STEP 2 — Enable the Google Calendar API
-//   → In your project, go to APIs & Services → Library
-//   → Search "Google Calendar API" → Enable it
+// 1. Go to https://console.cloud.google.com
+//    Create a new project (e.g. "Dental Voice Agent")
 //
-// STEP 3 — Create a Service Account
-//   → Go to APIs & Services → Credentials → Create Credentials → Service Account
-//   → Name it anything (e.g. "voice-agent"), click Done
-//   → Click the service account → Keys tab → Add Key → JSON
-//   → A .json file downloads — open it and copy:
-//       "client_email"  → this is your GOOGLE_SERVICE_ACCOUNT_EMAIL
-//       "private_key"   → this is your GOOGLE_PRIVATE_KEY
+// 2. Enable APIs:
+//    → APIs & Services → Library
+//    → Enable "Google Calendar API"
+//    → Enable "Google Sheets API"
 //
-// STEP 4 — Create a demo Google Calendar
-//   → Go to: https://calendar.google.com
-//   → Click + (Other calendars) → Create new calendar
-//   → Name it "Bright Smile Dental Demo"
-//   → Go to its Settings → Share with specific people
-//   → Add your service account email (client_email from the JSON)
-//   → Give it "Make changes to events" permission
-//   → Scroll down to "Integrate calendar" → copy the Calendar ID
-//   → This is your GOOGLE_CALENDAR_ID
+// 3. Create a Service Account:
+//    → APIs & Services → Credentials → Create Credentials → Service Account
+//    → Name it anything (e.g. "voice-agent") → Done
+//    → Click the service account → Keys tab → Add Key → JSON
+//    → Open the downloaded file and copy:
+//        "client_email"  →  GOOGLE_SERVICE_ACCOUNT_EMAIL
+//        "private_key"   →  GOOGLE_PRIVATE_KEY
 //
-// STEP 5 — Add to Railway environment variables:
-//   GOOGLE_SERVICE_ACCOUNT_EMAIL = (client_email from JSON)
+// ══════════════════════════════════════════════════════
+// PART 2 — GOOGLE CALENDAR
+// ══════════════════════════════════════════════════════
+//
+// 4. Go to https://calendar.google.com
+//    → + Other calendars → Create new calendar
+//    → Name: "Bright Smile Dental Demo"
+//    → Settings → Share with specific people
+//    → Add your service account email → Permission: "Make changes to events"
+//    → Settings → Integrate calendar → copy the Calendar ID
+//    → This is your GOOGLE_CALENDAR_ID
+//
+// ══════════════════════════════════════════════════════
+// PART 3 — GOOGLE SHEETS LEAD LOG
+// ══════════════════════════════════════════════════════
+//
+// 5. Go to https://sheets.google.com → Blank spreadsheet
+//    Name it: "Bright Smile Dental — Leads"
+//
+// 6. Add this header row in Row 1 (cells A1 through G1):
+//    Timestamp | Patient Name | Phone | Reason | Category | Patient Type | Appointment
+//
+// 7. Share the sheet with your service account:
+//    → Click Share → add your GOOGLE_SERVICE_ACCOUNT_EMAIL → Role: Editor
+//
+// 8. Get the Sheet ID from the URL:
+//    https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID_HERE/edit
+//    → Copy the ID between /d/ and /edit
+//    → This is your GOOGLE_SHEET_ID
+//
+// ══════════════════════════════════════════════════════
+// PART 4 — RAILWAY ENVIRONMENT VARIABLES
+// ══════════════════════════════════════════════════════
+//
+// Add all of these in Railway → Variables:
+//
+//   TWILIO_ACCOUNT_SID            = (from Twilio console)
+//   TWILIO_AUTH_TOKEN             = (from Twilio console)
+//   TWILIO_PHONE_NUMBER           = +1XXXXXXXXXX   ← your Twilio number
+//   OWNER_PHONE                   = +1XXXXXXXXXX   ← your personal cell
+//   OPENAI_API_KEY                = (from OpenAI)
+//   GOOGLE_SERVICE_ACCOUNT_EMAIL  = (client_email from JSON)
 //   GOOGLE_PRIVATE_KEY            = (private_key from JSON — keep the \n characters)
-//   GOOGLE_CALENDAR_ID            = (Calendar ID from Step 4)
-//   TZ                            = America/New_York  (or your timezone)
+//   GOOGLE_CALENDAR_ID            = (from Part 2)
+//   GOOGLE_SHEET_ID               = (from Part 3, step 8)
+//   TZ                            = America/New_York
 //
-// STEP 6 — Deploy:
+// DEMO MODE:
+//   Set OWNER_PHONE to your personal number. Both the owner summary SMS and
+//   the customer confirmation SMS will land on your phone so you can show
+//   both during a live demo.
+//
+//   When going to production:
+//   - Change OWNER_PHONE to the real practice owner's number
+//   - In sendCustomerConfirmationText(), swap `to: OWNER_PHONE` → `to: phone`
+//
+// ══════════════════════════════════════════════════════
+// PART 5 — DEPLOY
+// ══════════════════════════════════════════════════════
+//
+//   npm install googleapis   (if not already installed)
 //   git add server.js
-//   git commit -m "add Google Calendar booking"
+//   git commit -m "add Sheets logging + demo SMS routing"
 //   git push
 //
-// That's it — calls will now appear in your demo calendar color-coded by priority.
 // ─────────────────────────────────────────────────────────────────────────────
