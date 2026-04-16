@@ -796,6 +796,7 @@ wss.on('connection', (twilioWs) => {
 
             offeredSlots = [];
             callBooked   = true;
+            callPhase    = 'done';
 
             const event = await createAppointment({
               name: args.name, phone: phoneToUse, reason: args.reason,
@@ -869,8 +870,22 @@ wss.on('connection', (twilioWs) => {
           waitingForTwilioPlaybackMark = true;
           console.log('OpenAI done — sending Twilio mark, waiting for playback to finish');
           sendTwilioMark(FINAL_PLAYBACK_MARK);
-          // Reset speech tracking so stale state doesn't bleed into next turn
           callerHasStartedSpeaking = false;
+          return;
+        }
+
+        // If booking is done and the AI just finished the closing summary,
+        // nudge it to call end_call in case it forgot or got confused.
+        // We use a short delay to let the tool call fire naturally first.
+        if (callBooked && callPhase === 'done') {
+          setTimeout(() => {
+            if (!pendingHangup && !callClosed) {
+              console.log('Nudging AI to call end_call after closing summary');
+              createAssistantResponse(
+                'You have finished the closing summary. Now call the end_call tool immediately. Do not say anything else.'
+              );
+            }
+          }, 2000);
           return;
         }
 
