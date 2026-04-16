@@ -79,6 +79,7 @@ const BUSINESS_HOURS = {
 //           E=Category   F=Patient Type  G=Appointment Date & Time
 // ─────────────────────────────────────────────────────────────────────────────
 async function logToSheet({ name, phone, reason, category, patientType, datetime }) {
+  console.log(`logToSheet — SHEET_ID=${SHEET_ID || 'NOT SET'}`);
   if (!SHEET_ID) {
     console.warn('GOOGLE_SHEET_ID not set — skipping sheet log');
     return;
@@ -137,6 +138,7 @@ const NEW_PATIENT_BRING_LIST = [
  * Owner summary SMS — sent to OWNER_PHONE (your personal number in demo mode).
  */
 async function sendOwnerSummaryText({ name, phone, reason, category, patientType, datetime, durationMinutes }) {
+  console.log(`sendOwnerSummaryText — TWILIO_PHONE=${TWILIO_PHONE || 'NOT SET'} OWNER_PHONE=${OWNER_PHONE || 'NOT SET'}`);
   if (!TWILIO_PHONE || !OWNER_PHONE) {
     console.warn('TWILIO_PHONE or OWNER_PHONE not set — skipping owner SMS');
     return;
@@ -178,6 +180,7 @@ async function sendOwnerSummaryText({ name, phone, reason, category, patientType
  * New patients also receive the "what to bring" list.
  */
 async function sendCustomerConfirmationText({ name, phone, reason, patientType, datetime, durationMinutes }) {
+  console.log(`sendCustomerConfirmationText — TWILIO_PHONE=${TWILIO_PHONE || 'NOT SET'} OWNER_PHONE=${OWNER_PHONE || 'NOT SET'}`);
   if (!TWILIO_PHONE) {
     console.warn('TWILIO_PHONE not set — skipping customer SMS');
     return;
@@ -444,9 +447,9 @@ STEP 9 — NOW call book_appointment with:
          name (full), phone (confirmed in Step 8), reason, category, patient_type,
          datetime (exact ISO string from the slots array), duration_minutes.
 
-STEP 10 — After booking is confirmed, give the closing summary:
-          "[Full name], you're all set! We have you booked for [reason] on [day] at [time].
-           We'll reach you at [confirmed phone number]. We'll see you then — thank you, and have a great day!"
+STEP 10 — After booking is confirmed, give the closing summary in ONE sentence:
+          "[Full name], you're all set! We have you booked for [reason] on [day] at [time]. We'll see you then — thank you, and have a great day!"
+          Do NOT repeat the phone number — it was already confirmed in Step 8.
           Then call the end_call tool. Do not say anything else.
 
 ════════════════════════════════════════════
@@ -479,6 +482,7 @@ wss.on('connection', (twilioWs) => {
   let callerPhoneNumber            = null;
   let openaiReady                  = false;
   let greetingSent                 = false;
+  let greetingComplete              = false;  // true only after greeting response.done fires
   let callClosed                   = false;
   let callBooked                   = false;
   let pendingHangup                = false;
@@ -552,6 +556,12 @@ wss.on('connection', (twilioWs) => {
   function sendGreeting() {
     if (!openaiReady || !streamSid || greetingSent || callClosed) return;
     greetingSent = true;
+    greetingComplete = false;
+    // Clear any audio that arrived before the greeting starts — prevents
+    // connection noise or echo from being processed as caller speech.
+    safeSendToOpenAI({ type: 'input_audio_buffer.clear' });
+    // Block VAD for the entire greeting duration + 1200ms tail
+    ignoreCallerAudioUntil = Infinity;
     createAssistantResponse(
       'Speak in English only. Say exactly: "Hi, thanks for calling Bright Smile Dental, how can I help you today?" Then stop and wait for the caller to answer.'
     );
@@ -673,11 +683,15 @@ wss.on('connection', (twilioWs) => {
 
             // Fire all three post-call actions in parallel — all non-fatal
             if (bookedAppointment) {
+              console.log('Firing post-call actions for:', JSON.stringify(bookedAppointment));
               Promise.all([
                 sendOwnerSummaryText(bookedAppointment),
                 sendCustomerConfirmationText(bookedAppointment),
                 logToSheet(bookedAppointment),
-              ]).catch(err => console.error('Post-call action error:', err.message));
+              ]).then(() => console.log('All post-call actions completed'))
+                .catch(err => console.error('Post-call action error:', err.message));
+            } else {
+              console.warn('end_call fired but bookedAppointment is null — no SMS or sheet log sent');
             }
 
             return; // hang up after response.done + Twilio mark
@@ -759,7 +773,7 @@ wss.on('connection', (twilioWs) => {
         } else if (fnName === 'book_appointment') {
           if (result.success) {
             createAssistantResponse(
-              "The appointment is confirmed. Say the closing summary out loud: use their full name, confirm the reason, date, time, and the phone number we have on file. End with \"We'll see you then — thank you, and have a great day!\" Then immediately call the end_call tool. Do not say anything else."
+              "The appointment is confirmed. Give the closing summary — keep it to ONE short sentence: '[Full name], you're all set! We have you booked for [reason] on [day] at [time]. We'll see you then — thank you, and have a great day!' Do NOT mention the phone number again — it was already confirmed. Then immediately call the end_call tool. Do not say anything else."
             );
           } else if (result.error === 'SLOT_TAKEN') {
             createAssistantResponse(
@@ -773,10 +787,16 @@ wss.on('connection', (twilioWs) => {
 
       if (data.type === 'response.done') {
         assistantSpeaking = false;
-        // Give a 600 ms cooldown after AI stops so its own audio tail can't
-        // trigger a false speech_started / speech_stopped event on the input.
-        ignoreCallerAudioUntil = Date.now() + 600;
+        // 1200ms cooldown after AI stops — clears echo/audio tail from the line
+        // before we start listening for real caller speech.
+        ignoreCallerAudioUntil = Date.now() + 1200;
         console.log('Assistant finished speaking — cooldown started');
+
+        // Mark greeting as complete so speech_stopped can now trigger responses
+        if (!greetingComplete) {
+          greetingComplete = true;
+          console.log('Greeting complete — now listening for caller');
+        }
 
         if (pendingHangup) {
           pendingHangup                = false;
@@ -821,6 +841,13 @@ wss.on('connection', (twilioWs) => {
           return;
         }
         console.log('Caller stopped speaking');
+
+        // Do not respond until greeting has fully finished playing
+        if (!greetingComplete) {
+          console.log('speech_stopped ignored — greeting not yet complete');
+          safeSendToOpenAI({ type: 'input_audio_buffer.clear' });
+          return;
+        }
 
         if (callerHasStartedSpeaking && !callBooked) {
           if (!assistantSpeaking) {
